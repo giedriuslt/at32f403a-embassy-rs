@@ -21,9 +21,10 @@ KWS-X1. Register semantics are cross-checked against the vendor
 | `clocks` | done (needs silicon validation) | HICK/HEXT(÷2)/PLL startup, checked dividers, SCLK/AHB ≤ 240 MHz and APB ≤ 120 MHz limits, inherited-PLL step-down, auto-step switchover, exact `Clocks` snapshot with timer-clock doubling |
 | `time_driver` | done (needs silicon validation) | exact 1 kHz SysTick driver, 16-slot timer queue, ported verbatim from the proven HC32 driver |
 | `gpio` | done (needs silicon validation) | pin tokens with input (floating/pull up/down), output (push-pull/open-drain, two drive strengths), analog and mux modes; atomic set/clear through SCR; `embedded-hal` 1.0 digital traits |
-| `exti` (EXINT) | not started | async `ExtiInput`, needed for FUSB302 INT, accelerometer INT, D− edge timing |
-| `i2c` | not started | async master, shared bus for TPA626/KXTJ3/FUSB302 |
+| `exti` | done (needs silicon validation) | two-flag latch design from embassy-hc32; IOMUX port select, edge polarity, grouped vectors; `embedded-hal-async` `Wait` |
+| `i2c` | done (needs silicon validation) | async master over I2C1 with vendor timing formulas (5 host tests) and the vendor read endgame (1/2/3-byte ACK/POS cases); I2C3 sits on APB2 |
 | `spi` | not started | TX + DMA for the display |
+| `pwm` | not started | backlight timer (TMR channel; F1-style PWM setup) |
 | `adc` | not started | scan (D±/CC lines + VREFINT) and continuous DMA capture (ripple) |
 | `dma` | not started | 2 units × 7 channels |
 | `pwm` | not started | backlight timer |
