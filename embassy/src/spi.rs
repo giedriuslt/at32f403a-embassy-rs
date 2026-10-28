@@ -12,16 +12,13 @@
 //! map to `CLKPOL`/`CLKPHA`, and frames are 8-bit MSB-first. Chip select is
 //! the board's job.
 
-use core::future::poll_fn;
-use core::task::Poll;
-
-use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::Timer;
 
 use crate::dma::{self, Channel as DmaChannel, Direction, Request, Width};
 use crate::pac::at32f403a::spi1::RegisterBlock;
 use crate::pac::at32f403a::spi1::ctrl1::{
     CLKPHA_A as ClkphaA, CLKPOL_A as ClkpolA, FBN_A as FbnA, LTF_A as LtfA, MSTEN_A as MstenA,
-    SpienwWO,
+    SLBTD_A, SWCSIL_A, SlbenwWO, SpienwWO, SwcsenwWO,
 };
 use crate::pac::at32f403a::{CRM, SPI1};
 
@@ -85,15 +82,10 @@ impl Divider {
 pub enum Error {
     #[error("the peripheral did not reach the expected state in time")]
     Timeout,
+    #[error("mode fault: another master drove the bus (internal CS dropped)")]
+    ModeFault,
     #[error("the DMA transfer failed")]
     Dma(#[from] dma::Error),
-}
-
-static WAKER: AtomicWaker = AtomicWaker::new();
-
-/// Board interrupt hook for the `SPI1` vector (drives the flag waits).
-pub fn on_interrupt() {
-    WAKER.wake();
 }
 
 /// SPI master over one peripheral instance.
@@ -106,9 +98,9 @@ impl Spi {
     ///
     /// # Safety
     ///
-    /// The caller must exclusively own the peripheral, and route its NVIC
-    /// vector to a handler calling [`on_interrupt`], before any transfer.
-    /// Pin muxing is the board's job.
+    /// The caller must exclusively own the peripheral. All waits poll with
+    /// a deadline, so no NVIC routing is required. Pin muxing is the
+    /// board's job.
     pub unsafe fn new_spi1(mode: Mode, divider: Divider) -> Self {
         // SAFETY: forwarded from this constructor's exclusive-startup contract.
         let crm = unsafe { CRM::steal() };
@@ -138,6 +130,16 @@ impl Spi {
             });
             w.ltf().variant(LtfA::Msb);
             w.fbn().variant(FbnA::Bit8);
+            // Transmit-only: the single-bi direction sends, so the receive
+            // buffer never fills and ROERR cannot latch. RX-only TX mode
+            // would keep full-duplex timing but we never read MISO.
+            w.slben().variant(SlbenwWO::Enable);
+            w.slbtd().variant(SLBTD_A::Transmit);
+            // Software chip-select: hardware CS would sample the (panel)
+            // CS pin and drop out of master mode with MMERR when it reads
+            // low. Keep the internal NSS level high.
+            w.swcsen().variant(SwcsenwWO::Enable);
+            w.swcsil().variant(SWCSIL_A::High);
             // SAFETY: divider encoding is 0..=9; the low 3 bits fit MDIV2_0.
             unsafe { w.mdiv2_0().bits((divider as u8) & 0x07) };
             w
@@ -154,26 +156,29 @@ impl Spi {
         self.spi.sts().read()
     }
 
+    /// Poll until `ready` holds or the deadline passes. The wait is
+    /// timer-backed rather than interrupt-driven: bring-up does not depend
+    /// on NVIC routing, and a masked interrupt can never hang it.
     async fn wait_flag(
         &self,
-        ready: impl Fn(&crate::pac::at32f403a::spi1::sts::R) -> bool + Unpin,
+        ready: impl Fn(&crate::pac::at32f403a::spi1::sts::R) -> bool,
     ) -> Result<(), Error> {
         let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(50);
-        poll_fn(|cx| {
-            WAKER.register(cx.waker());
+        loop {
             let sts = self.sts();
-            if sts.roerr().bit() || sts.tuerr().bit() || sts.mmerr().bit() {
-                return Poll::Ready(Err(Error::Timeout));
+            if sts.mmerr().bit() {
+                // MMERR clears on an STS read; clear it before reporting.
+                let _ = self.sts();
+                return Err(Error::ModeFault);
             }
             if ready(&sts) {
-                return Poll::Ready(Ok(()));
+                return Ok(());
             }
             if embassy_time::Instant::now() >= deadline {
-                return Poll::Ready(Err(Error::Timeout));
+                return Err(Error::Timeout);
             }
-            Poll::Pending
-        })
-        .await
+            Timer::after_micros(2).await;
+        }
     }
 
     /// Wait until the last byte leaves the shift register (`TDBE` set and
@@ -185,18 +190,12 @@ impl Spi {
 
     /// Write bytes one buffer-empty event at a time (commands, small frames).
     pub async fn write(&self, bytes: &[u8]) -> Result<(), Error> {
-        self.spi.ctrl2().modify(|_, w| w.tdbeie().bit(true));
-        let result = async {
-            for &byte in bytes {
-                self.wait_flag(|sts| sts.tdbe().bit()).await?;
-                // SAFETY: 8-bit frame in a whole-value 16-bit data register.
-                self.spi.dt().write(|w| unsafe { w.bits(u16::from(byte)) });
-            }
-            self.flush().await
+        for &byte in bytes {
+            self.wait_flag(|sts| sts.tdbe().bit()).await?;
+            // SAFETY: 8-bit frame in a whole-value 16-bit data register.
+            self.spi.dt().write(|w| unsafe { w.bits(u16::from(byte)) });
         }
-        .await;
-        self.spi.ctrl2().modify(|_, w| w.tdbeie().bit(false));
-        result
+        self.flush().await
     }
 
     /// Write a long buffer through DMA (pixel bursts), request `SPI1_TX`.
