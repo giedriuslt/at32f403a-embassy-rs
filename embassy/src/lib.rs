@@ -18,9 +18,12 @@
 //!   `on_interrupt`/`on_interrupts_in`.
 //! - **I²C:** async master (I2C1 today) with vendor timing formulas and the
 //!   vendor read endgame (1/2/3-byte ACK/POS cases).
+//! - **DMA:** two units × 7 F1-style channels, flexible request mapping,
+//!   async completion waits, abort-on-drop.
+//! - **SPI:** transmit-focused master (SPI1 today): byte-wise write,
+//!   flush fencing, and pixel bursts through DMA.
 //!
-//! Not yet implemented: SPI, ADC, DMA, timers/PWM, USB device, flash
-//! programming.
+//! Not yet implemented: ADC, timers/PWM, USB device, flash programming.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -28,9 +31,11 @@
 pub use at32f4xx_pac as pac;
 
 pub mod clocks;
+pub mod dma;
 pub mod exti;
 pub mod gpio;
 pub mod i2c;
+pub mod spi;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
 
