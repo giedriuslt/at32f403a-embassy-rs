@@ -23,10 +23,10 @@ KWS-X1. Register semantics are cross-checked against the vendor
 | `gpio` | done (needs silicon validation) | pin tokens with input (floating/pull up/down), output (push-pull/open-drain, two drive strengths), analog and mux modes; atomic set/clear through SCR; `embedded-hal` 1.0 digital traits |
 | `exti` | done (needs silicon validation) | two-flag latch design from embassy-hc32; IOMUX port select, edge polarity, grouped vectors; `embedded-hal-async` `Wait` |
 | `i2c` | done (needs silicon validation) | async master over I2C1 with vendor timing formulas (5 host tests) and the vendor read endgame (1/2/3-byte ACK/POS cases); I2C3 sits on APB2 |
-| `spi` | not started | TX + DMA for the display |
-| `pwm` | not started | backlight timer (TMR channel; F1-style PWM setup) |
+| `spi` | done (needs silicon validation) | TX-focused master (SPI1): mode + MDIV2_0/MDIV3 divider, async byte write, TDBE+!BF flush fence, DMA pixel bursts (`SPI1_TX` request) |
+| `pwm` | done (needs silicon validation) | TMR3 output channels; smallest-fitting-prescaler time base; CM1/CM2 mode bits via documented raw pointers (PAC gap) |
 | `adc` | not started | scan (D±/CC lines + VREFINT) and continuous DMA capture (ripple) |
-| `dma` | not started | 2 units × 7 channels |
+| `dma` | done (needs silicon validation) | 2 units × 7 F1-style channels, flexible request mapping, async full-transfer waits, abort-on-drop |
 | `pwm` | not started | backlight timer |
 | flash | not started | AT32 flash controller differs from HC32 EFM; sector sizes from the RM |
 
@@ -62,6 +62,9 @@ cargo check -p embassy-at32 --no-default-features --target thumbv7em-none-eabihf
 cargo clippy -p embassy-at32 --target thumbv7em-none-eabihf -- -D warnings
 cargo test -p embassy-at32 --lib
 ```
+
+21 host tests cover the clock, I²C timing, SPI divider and PWM time-base
+arithmetic.
 
 Host tests cover the pure clock arithmetic, limit checks and SysTick reload
 math. They do not prove timing or behavior on silicon.
