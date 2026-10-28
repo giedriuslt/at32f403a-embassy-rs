@@ -22,8 +22,11 @@
 //!   async completion waits, abort-on-drop.
 //! - **SPI:** transmit-focused master (SPI1 today): byte-wise write,
 //!   flush fencing, and pixel bursts through DMA.
+//! - **PWM:** TMR3 output channels (backlight class) with a host-tested
+//!   time-base picker; the unmapped CM1/CM2 mode registers are written
+//!   through documented raw pointers.
 //!
-//! Not yet implemented: ADC, timers/PWM, USB device, flash programming.
+//! Not yet implemented: ADC, USB device, flash programming.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -35,6 +38,7 @@ pub mod dma;
 pub mod exti;
 pub mod gpio;
 pub mod i2c;
+pub mod pwm;
 pub mod spi;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
