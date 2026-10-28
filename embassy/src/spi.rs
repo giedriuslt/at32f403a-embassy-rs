@@ -6,9 +6,9 @@
 //! transmit-idle fencing, and [`Spi::write_dma`] for pixel bursts through a
 //! [`crate::dma::Channel`].
 //!
-//! The clock-divider encoding is the vendor's (`CTRL1.MDIV2_0` plus
-//! `CTRL2.MDIV3` for /512 and /1024; `spi_init`): SCK = PCLK / 2^(encoding
-//! + 1), with the high encoding bit split across the two registers. Modes
+//! The clock-divider encoding is the vendor's (`spi_init`): SCK equals PCLK
+//! divided by 2^(encoding + 1), with the encoding's low three bits in
+//! `CTRL1.MDIV2_0` and its high bit in `CTRL2.MDIV3` (for /512 and /1024). Modes
 //! map to `CLKPOL`/`CLKPHA`, and frames are 8-bit MSB-first. Chip select is
 //! the board's job.
 
