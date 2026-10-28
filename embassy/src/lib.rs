@@ -13,8 +13,14 @@
 //! - **GPIO:** pin tokens with digital/analog/alternate modes over the
 //!   F1-style configuration registers.
 //!
-//! Not yet implemented: EXINT (async EXTI), I2C, SPI, ADC, DMA, timers/PWM,
-//! USB device, flash programming.
+//! - **EXINT:** async edge-triggered inputs with a two-flag latch design
+//!   (ported from the HC32 driver), grouped NVIC vectors serviced through
+//!   `on_interrupt`/`on_interrupts_in`.
+//! - **I²C:** async master (I2C1 today) with vendor timing formulas and the
+//!   vendor read endgame (1/2/3-byte ACK/POS cases).
+//!
+//! Not yet implemented: SPI, ADC, DMA, timers/PWM, USB device, flash
+//! programming.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -22,7 +28,9 @@
 pub use at32f4xx_pac as pac;
 
 pub mod clocks;
+pub mod exti;
 pub mod gpio;
+pub mod i2c;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
 

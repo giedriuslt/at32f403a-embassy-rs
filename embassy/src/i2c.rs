@@ -1,0 +1,483 @@
+//! Async I²C master (one peripheral instance at a time) for the AT32F403A's
+//! STM32F1-style I²C blocks.
+//!
+//! Timing follows the vendor `i2c_init` formulas: `CLKFREQ = PCLK / 1 MHz`,
+//! standard mode `SPEED = PCLK / (2 × Hz)` (minimum 4), fast mode
+//! `SPEED = PCLK / (3 × Hz)` at duty 2:1 or `PCLK / (25 × Hz)` at duty 16:9,
+//! rise time `freq_MHz + 1` (standard) or `freq_MHz × 0.3 + 1` (fast, up to
+//! 400 kHz). I2C1/I2C2 sit on APB1; **I2C3 sits on APB2** (vendor
+//! `i2c_init`), so its configuration takes the APB2 clock.
+//!
+//! Transaction sequences follow the vendor `i2c_application` library:
+//! START → address (wait `STARTF`, then `ADDR7F`, ACK-checked) → the
+//! 1/2/3-byte read endgames with ACK and POS (`MACKCTRL`) → STOP. The
+//! `ADDR7F` flag is cleared by reading STS1 then STS2, as the F1-style
+//! hardware requires.
+//!
+//! The driver is interrupt-driven: the board's `I2Cn_EVT` and `I2Cn_ERR`
+//! handlers call [`on_interrupt`], which wakes the task waiting for the next
+//! status change. Every wait is bounded by an Embassy timeout; a transfer
+//! that cannot progress latches its error and stops generating START/STOP.
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+use embassy_sync::waitqueue::AtomicWaker;
+use embassy_time::Duration;
+
+use crate::pac::at32f403a::i2c1::RegisterBlock;
+use crate::pac::at32f403a::{CRM, I2C1};
+
+/// Default per-step deadline; generous for a 100 kHz bus with clock
+/// stretching (a stuck bus fails at this bound rather than hanging).
+const STEP_TIMEOUT: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    #[error("the peripheral did not reach the expected state in time")]
+    Timeout,
+    #[error("arbitration lost")]
+    ArbitrationLoss,
+    #[error("bus error (misplaced START/STOP, no external pull-ups)")]
+    Bus,
+    #[error("data overrun/underrun")]
+    Overrun,
+    #[error("SMBus timeout")]
+    ClockTimeout,
+    #[error("the address or data was not acknowledged")]
+    NoAcknowledge(NoAcknowledgeSource),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoAcknowledgeSource {
+    Address,
+    Data,
+}
+
+impl embedded_hal::i2c::Error for Error {
+    fn kind(&self) -> embedded_hal::i2c::ErrorKind {
+        match self {
+            Self::NoAcknowledge(source) => {
+                embedded_hal::i2c::ErrorKind::NoAcknowledge(match source {
+                    NoAcknowledgeSource::Address => embedded_hal::i2c::NoAcknowledgeSource::Address,
+                    NoAcknowledgeSource::Data => embedded_hal::i2c::NoAcknowledgeSource::Data,
+                })
+            }
+            Self::ArbitrationLoss => embedded_hal::i2c::ErrorKind::ArbitrationLoss,
+            Self::Bus => embedded_hal::i2c::ErrorKind::Bus,
+            Self::Overrun => embedded_hal::i2c::ErrorKind::Overrun,
+            _ => embedded_hal::i2c::ErrorKind::Other,
+        }
+    }
+}
+
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// Fast-mode duty cycle (vendor `i2c_fsmode_duty_cycle_type`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Duty {
+    /// SCL high:low = 1:2 (`SPEED = PCLK / (3 × Hz)`).
+    Duty2To1,
+    /// SCL high:low = 9:16 (`SPEED = PCLK / (25 × Hz)`).
+    Duty16To9,
+}
+
+/// Bus speed selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speed {
+    /// Up to 100 kHz.
+    Standard,
+    /// Up to 400 kHz with the given duty cycle.
+    Fast(Duty),
+}
+
+impl Speed {
+    fn hz(self) -> u32 {
+        match self {
+            Self::Standard => 100_000,
+            Self::Fast(_) => 400_000,
+        }
+    }
+}
+
+/// Computed `CLKCTRL`/`TMRISE` values for one configuration; pure, so it
+/// can be tested on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timing {
+    /// `CTRL2.CLKFREQ`: the peripheral's PCLK in MHz.
+    pub clkfreq: u8,
+    /// `CLKCTRL.SPEED`: the divider value.
+    pub speed: u16,
+    /// `CLKCTRL.SPEEDMODE`: fast mode.
+    pub fast: bool,
+    /// `CLKCTRL.DUTYMODE`: 16:9 duty in fast mode.
+    pub duty_16_9: bool,
+    /// `TMRISE.RISETIME`.
+    pub risetime: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigError {
+    #[error("PCLK must be a whole number of MHz")]
+    ClockNotMhz,
+    #[error("the computed CLKCTRL.SPEED value does not fit 12 bits")]
+    SpeedRange,
+    #[error("PCLK is too high for this bus speed (SPEED below the minimum)")]
+    SpeedTooLow,
+}
+
+/// Compute the F1-style timing registers for `bus_hz` from a peripheral
+/// clocked at `pclk_hz`, exactly as the vendor `i2c_init` does.
+pub fn compute_timing(pclk_hz: u32, bus: Speed) -> core::result::Result<Timing, ConfigError> {
+    let freq_mhz = pclk_hz / 1_000_000;
+    if freq_mhz == 0 || !pclk_hz.is_multiple_of(1_000_000) || freq_mhz > u8::MAX as u32 {
+        return Err(ConfigError::ClockNotMhz);
+    }
+    let freq_mhz = freq_mhz as u8;
+    match bus {
+        Speed::Standard => {
+            // Standard mode: SPEED = PCLK / (2 × Hz), minimum 4.
+            let speed = (pclk_hz / (bus.hz() * 2)) as u16;
+            let speed = if speed < 4 { 4 } else { speed };
+            if speed > 0x0FFF {
+                return Err(ConfigError::SpeedRange);
+            }
+            let rise = (u16::from(freq_mhz) + 1).min(0x3F) as u8;
+            Ok(Timing {
+                clkfreq: freq_mhz,
+                speed,
+                fast: false,
+                duty_16_9: false,
+                risetime: rise,
+            })
+        }
+        Speed::Fast(duty) => {
+            let (div, duty_16_9) = match duty {
+                Duty::Duty2To1 => (3u32, false),
+                Duty::Duty16To9 => (25u32, true),
+            };
+            let mut speed = (pclk_hz / (bus.hz() * div)) as u16;
+            if speed == 0 {
+                speed = 1;
+            }
+            if speed > 0x0FFF {
+                return Err(ConfigError::SpeedRange);
+            }
+            // Fast mode rise time for <= 400 kHz.
+            let rise = ((u16::from(freq_mhz) * 300) / 1000 + 1).min(0x3F) as u8;
+            Ok(Timing {
+                clkfreq: freq_mhz,
+                speed,
+                fast: true,
+                duty_16_9,
+                risetime: rise,
+            })
+        }
+    }
+}
+
+/// Which APB bus a peripheral instance hangs from (vendor `i2c_init`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instance {
+    /// I2C1 and I2C2: APB1.
+    Apb1,
+    /// I2C3: APB2.
+    Apb2,
+}
+
+static WAKER: AtomicWaker = AtomicWaker::new();
+
+/// Board interrupt hook for the `I2Cn_EVT` and `I2Cn_ERR` vectors: wakes
+/// the task waiting for a status-flag change.
+pub fn on_interrupt() {
+    WAKER.wake();
+}
+
+/// The async I²C master over one peripheral instance.
+pub struct I2c {
+    i2c: &'static RegisterBlock,
+    /// APB prescaler bit position is per-instance; clock enable is done in `new`.
+    _instance: Instance,
+}
+
+impl I2c {
+    /// Create the driver over `I2C1` and program its timing.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclusively own the peripheral and its `I2C1_EVT` /
+    /// `I2C1_ERR` vectors (both routed to handlers that call
+    /// [`on_interrupt`]) before any transfer. Pin muxing is the board's job.
+    pub unsafe fn new_i2c1(pclk_hz: u32, speed: Speed) -> core::result::Result<Self, ConfigError> {
+        let timing = compute_timing(pclk_hz, speed)?;
+        // SAFETY: clock setup under this constructor's exclusive-ownership contract.
+        let crm = unsafe { CRM::steal() };
+        critical_section::with(|_| {
+            crm.apb1en().modify(|_, w| w.i2c1().bit(true));
+        });
+        // SAFETY: the peripheral's static register block, exclusively owned by
+        // this constructor's contract.
+        let i2c = unsafe { &*I2C1::ptr() };
+        let this = Self {
+            i2c,
+            _instance: Instance::Apb1,
+        };
+        this.apply_timing(timing);
+        Ok(this)
+    }
+
+    fn apply_timing(&self, timing: Timing) {
+        self.i2c
+            .ctrl1()
+            .modify(|_, w| w.i2cen().variant(I2cenwWO::Disable));
+        self.i2c
+            .ctrl2()
+            .modify(|_, w| unsafe { w.clkfreq().bits(timing.clkfreq) });
+        self.i2c.clkctrl().modify(|_, w| {
+            unsafe { w.speed().bits(timing.speed) };
+            w.speedmode().bit(timing.fast);
+            w.dutymode().bit(timing.duty_16_9)
+        });
+        self.i2c
+            .tmrise()
+            .modify(|_, w| unsafe { w.risetime().bits(timing.risetime) });
+        self.i2c
+            .ctrl1()
+            .modify(|_, w| w.i2cen().variant(I2cenwWO::Enable));
+        // Event, buffer and error interrupts drive the waits.
+        self.i2c.ctrl2().modify(|_, w| {
+            w.evtien().bit(true);
+            w.errien().bit(true);
+            w.dataien().bit(true);
+            w
+        });
+    }
+
+    fn sts1(&self) -> crate::pac::at32f403a::i2c1::sts1::R {
+        self.i2c.sts1().read()
+    }
+
+    /// Latched error from the status registers, or the error bits' absence.
+    fn check_errors(&self, sts: &crate::pac::at32f403a::i2c1::sts1::R) -> Option<Error> {
+        if sts.ackfail().bit() {
+            Some(Error::NoAcknowledge(NoAcknowledgeSource::Data))
+        } else if sts.arlost().bit() {
+            Some(Error::ArbitrationLoss)
+        } else if sts.buserr().bit() {
+            Some(Error::Bus)
+        } else if sts.ouf().bit() {
+            Some(Error::Overrun)
+        } else if sts.tmout().bit() {
+            Some(Error::ClockTimeout)
+        } else {
+            None
+        }
+    }
+
+    fn clear_errors(&self) {
+        self.i2c.sts1().write(|w| {
+            w.ackfail().clear();
+            w.arlost().clear();
+            w.buserr().clear();
+            w.ouf().clear();
+            w.tmout().clear();
+            w
+        });
+    }
+
+    fn stop(&self) {
+        self.i2c
+            .ctrl1()
+            .modify(|_, w| w.genstop().variant(GENSTOP_A::Stop));
+    }
+
+    /// Wait until `ready` holds, returning its error if a status error
+    /// latches first. The waker is registered before the flag check, so an
+    /// interrupt between the two only re-polls.
+    async fn wait_until(
+        &self,
+        ready: impl Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool + Unpin,
+    ) -> Result<()> {
+        let deadline = embassy_time::Instant::from_ticks(
+            embassy_time::Instant::now().as_ticks() + STEP_TIMEOUT.as_ticks(),
+        );
+        WaitFlags {
+            i2c: self,
+            ready,
+            deadline,
+        }
+        .await
+    }
+
+    /// Send START and the address byte, and leave ADDR pending-cleared.
+    async fn start_address(&self, address: u8, read: bool) -> Result<()> {
+        // Clear errors from any previous transfer before judging this one.
+        self.clear_errors();
+        self.i2c
+            .ctrl1()
+            .modify(|_, w| w.genstart().variant(GENSTART_A::Start));
+        self.wait_until(|sts| sts.startf().bit()).await?;
+        let byte = (address << 1) | u8::from(read);
+        self.i2c.dt().write(|w| unsafe { w.dt().bits(byte) });
+        self.wait_until(|sts| sts.addr7f().bit()).await?;
+        // F1-style ADDR clear: read STS1, then STS2.
+        let _ = self.sts1();
+        let _ = self.i2c.sts2().read();
+        Ok(())
+    }
+
+    async fn write_bytes(&self, bytes: &[u8], last_in_transaction: bool) -> Result<()> {
+        for &byte in bytes {
+            self.wait_until(|sts| sts.tdbe().bit()).await?;
+            self.i2c.dt().write(|w| unsafe { w.dt().bits(byte) });
+        }
+        if last_in_transaction {
+            self.wait_until(|sts| sts.tdc().bit()).await?;
+            self.stop();
+        }
+        Ok(())
+    }
+
+    /// The vendor read endgame: exact ACK/POS handling for the last three
+    /// bytes (`i2c_application.c` receive sequence).
+    async fn read_bytes(&self, buffer: &mut [u8]) -> Result<()> {
+        let mut remaining = buffer.len();
+        let ack_all = |enable: bool| {
+            self.i2c.ctrl1().modify(|_, w| {
+                w.acken().variant(if enable {
+                    AckenwWO::Enable
+                } else {
+                    AckenwWO::Disable
+                })
+            });
+        };
+
+        match buffer.len() {
+            0 => return Ok(()),
+            1 => {
+                // No ACK for the only byte: STOP right after the address.
+                ack_all(false);
+                self.stop();
+            }
+            2 => {
+                // ACK the current byte, NACK the next, one clock stretch.
+                self.i2c
+                    .ctrl1()
+                    .modify(|_, w| w.mackctrl().variant(MACKCTRL_A::Next));
+                ack_all(false);
+            }
+            _ => {
+                ack_all(true);
+            }
+        }
+
+        let mut index = 0;
+        while remaining > 0 {
+            if remaining == 1 {
+                self.wait_until(|sts| sts.rdbf().bit()).await?;
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                remaining -= 1;
+            } else if remaining == 2 {
+                self.wait_until(|sts| sts.tdc().bit()).await?;
+                self.stop();
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                index += 1;
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                remaining = 0;
+            } else if remaining == 3 {
+                self.wait_until(|sts| sts.tdc().bit()).await?;
+                // NACK from the next received byte on.
+                ack_all(false);
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                index += 1;
+                self.wait_until(|sts| sts.tdc().bit()).await?;
+                self.stop();
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                index += 1;
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                remaining = 0;
+            } else {
+                self.wait_until(|sts| sts.rdbf().bit()).await?;
+                buffer[index] = self.i2c.dt().read().dt().bits();
+                index += 1;
+                remaining -= 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl embedded_hal::i2c::ErrorType for I2c {
+    type Error = Error;
+}
+
+impl embedded_hal_async::i2c::I2c for I2c {
+    async fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [embedded_hal_async::i2c::Operation<'_>],
+    ) -> Result<()> {
+        let last = operations.len().saturating_sub(1);
+        for (i, operation) in operations.iter_mut().enumerate() {
+            let is_last = i == last;
+            match operation {
+                embedded_hal_async::i2c::Operation::Write(buffer) => {
+                    self.start_address(address, false).await?;
+                    self.write_bytes(buffer, is_last).await?;
+                }
+                embedded_hal_async::i2c::Operation::Read(buffer) => {
+                    self.start_address(address, true).await?;
+                    self.read_bytes(buffer).await?;
+                    // Single-byte reads already generated STOP inside the
+                    // endgame; longer ones stopped after the final read.
+                    let _ = is_last;
+                }
+            }
+        }
+        // A read that did not end in STOP (a following WriteRead) leaves the
+        // bus held; every path here stops, so nothing to do.
+        Ok(())
+    }
+}
+
+struct WaitFlags<'a, F>
+where
+    F: Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool,
+{
+    i2c: &'a I2c,
+    ready: F,
+    deadline: embassy_time::Instant,
+}
+
+impl<F> Future for WaitFlags<'_, F>
+where
+    F: Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool + Unpin,
+{
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        WAKER.register(cx.waker());
+        let sts = this.i2c.sts1();
+        if let Some(error) = this.i2c.check_errors(&sts) {
+            this.i2c.stop();
+            this.i2c.clear_errors();
+            return Poll::Ready(Err(error));
+        }
+        if (this.ready)(&sts) {
+            return Poll::Ready(Ok(()));
+        }
+        if embassy_time::Instant::now() >= this.deadline {
+            this.i2c.stop();
+            return Poll::Ready(Err(Error::Timeout));
+        }
+        Poll::Pending
+    }
+}
+
+// The register enums re-exported for the driver's own use.
+use crate::pac::at32f403a::i2c1::ctrl1::{AckenwWO, GENSTART_A, GENSTOP_A, I2cenwWO, MACKCTRL_A};
+
+#[cfg(test)]
+mod tests;
