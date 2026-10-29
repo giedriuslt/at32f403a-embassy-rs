@@ -298,9 +298,11 @@ const DEVICE_DESC: [u8; 18] = [
     0x12, 0x01, 0x00, 0x02, // DEVICE, bcdUSB 2.0
     0x02, 0x00, 0x00, // class CDC
     EP_SIZE as u8, 0x3c, 0x2e, // EP0 size, VID 0x2e3c
-    0x59, 0x58, // PID 0x5859 (open firmware CDC)
+    0x59, 0x58, // PID 0x5859 default (open firmware CDC)
     0x00, 0x01, 1, 2, 0, 0x01,
 ];
+/// Byte offset of the PID halfword inside DEVICE_DESC.
+const DEVICE_DESC_PID_OFFSET: usize = 8;
 
 const CONFIG_DESC: [u8; 60] = [
     // Configuration (9): 100 mA, bus-powered.
@@ -396,6 +398,8 @@ impl Descriptor {
 }
 
 struct State {
+    /// PID reported in the device descriptor (encodes the clock path).
+    pid: u16,
     ctrl: CtrlState,
     /// Multi-chunk control read bookkeeping.
     ctrl_desc: Descriptor,
@@ -413,6 +417,7 @@ struct State {
 impl State {
     const fn new() -> Self {
         Self {
+            pid: 0x5859,
             ctrl: CtrlState::Idle,
             ctrl_desc: Descriptor::Device,
             ctrl_total: 0,
@@ -556,8 +561,9 @@ fn open_ept(index: usize, trans_type: u32) {
 /// Exclusive contract: claims the USBFS cell and its interrupt (the board
 /// unmasks `USBFS_H_CAN1_TX` or `USBFS_L_CAN1_RX0` with a handler calling
 /// [`on_interrupt`]). [`enable_usb_clock`] must have run.
-pub unsafe fn init() {
+pub unsafe fn init(pid: u16) {
     critical_section::with(|_| {
+        STATE.lock(|cell| cell.borrow_mut().pid = pid);
         // Own clock setup (vendor BSP order: CRM enables the USB register
         // clock before usb_dev_init). Doing it here — not in the board's
         // clock module — makes it impossible to attach without the cell
@@ -923,6 +929,12 @@ fn serve_slice(length: u16, bytes: &[u8], descriptor: Option<Descriptor>) {
     let total = bytes.len().min(length as usize);
     let chunk_len = total.min(EP_SIZE as usize);
     write_packet(BUF_EP0_TX, &bytes[..chunk_len]);
+    // Device descriptor: patch the runtime PID (clock-path marker) over
+    // the static default.
+    if bytes.len() == 18 {
+        let pid = STATE.lock(|cell| cell.borrow().pid);
+        set_packet_half(BUF_EP0_TX + DEVICE_DESC_PID_OFFSET, pid);
+    }
     set_tx_count(SLOT[0], chunk_len as u16);
     set_tx_status(0, STS_VALID);
 
