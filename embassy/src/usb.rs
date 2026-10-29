@@ -8,11 +8,12 @@
 //!   `USB_CLEAR_TXTC(eptn) = (ept &= 0xFF7F & 0x8F8F)`. The clear also
 //!   zeroes the endpoint's own status bits, which is the invariant that
 //!   makes the status-set idiom work (below).
-//! - **Endpoint status (TXSTS bits 5:4, RXSTS bits 13:12) is set with an
-//!   XOR**: `USB_SET_TXSTS` keeps the masked register, toggles the status
-//!   bits by the new encoding, and ORs the TC bits back to 1 (keeping
-//!   them). Because the TC clear reset the status to DISABLE, "toggling"
-//!   from DISABLE yields the intended status.
+//! - **Endpoint status (TXSTS bits 5:4, RXSTS bits 13:12) toggles on
+//!   written 1s**: each written 1 flips that bit. The vendor
+//!   `USB_SET_TXSTS` computes `current ^ new` implicitly (its masked
+//!   read carries the current status), landing on the desired state;
+//!   this driver computes the delta explicitly so the result is correct
+//!   from any starting state.
 //! - **INTSTS is write-zero-to-clear**: `usb_flag_clear` writes `~flag`.
 //!   `INTSTS.TC` (bit 15) clears when the endpoint's own TC clears, so the
 //!   IRQ drains pending endpoint events in a loop.
@@ -67,20 +68,17 @@ const INTS_TC: u32 = 1 << 15;
 
 // EPTn bits (vendor constants, verbatim).
 const EPT_EPTADDR: u32 = 0xf;
-const EPT_TXSTS: u32 = 0x30; // bits 5:4
 const EPT_TXTC: u32 = 0x80; // bit 7
 const EPT_EXF: u32 = 0x100; // bit 8
 const EPT_TRANS_TYPE: u32 = 0x600; // bits 10:9
 const EPT_SETUPTC: u32 = 0x800; // bit 11
-const EPT_RXSTS: u32 = 0x3000; // bits 13:12
 const EPT_RXTC: u32 = 0x8000; // bit 15
 
-/// Vendor `USB_EPT_BIT_MASK` (fields preserved across status writes).
+/// Fields preserved across status writes (vendor `USB_EPT_BIT_MASK`,
+/// minus the status fields, which the delta form writes explicitly).
 const EPT_BIT_MASK: u32 =
     EPT_TXTC | EPT_SETUPTC | EPT_EPTADDR | EPT_EXF | EPT_RXTC | EPT_TRANS_TYPE;
 /// Vendor `USB_TX_MASK` / `USB_RX_MASK`.
-const EPT_TX_MASK: u32 = EPT_TXSTS | EPT_BIT_MASK;
-const EPT_RX_MASK: u32 = EPT_RXSTS | EPT_BIT_MASK;
 /// Vendor `USB_CLEAR_TXTC` / `USB_CLEAR_RXTC` / `USB_CLEAR_SETUPTC` masks
 /// (the value ANDed into the register: zeros clear the flag and reset the
 /// endpoint's own status field to DISABLE).
@@ -145,32 +143,40 @@ fn ept_write(index: usize, value: u32) {
     reg_write(index * 4, value);
 }
 
+/// All Write-0-to-Clear flags in EPTn; written as 1 to preserve whatever
+/// fired between the read and the write.
+const EPT_W0C_MASK: u32 = EPT_TXTC | EPT_SETUPTC | EPT_RXTC;
+
 /// Set one endpoint's TX status to `desired`, from any current state.
 ///
-/// The vendor `USB_SET_TXSTS` macro XORs its argument into the current
-/// status field — correct only because vendor call sites always run right
-/// after a TC clear, which resets the field to DISABLE (`00`), making the
-/// XOR an absolute write. Arming an endpoint that is *not* in DISABLE
-/// (e.g. RX NAK from `open_ept` → VALID at init) with the plain macro
-/// computes `10 ^ 11 = 01` = **STALL**: the exact bug that stalled EP0's
-/// receiver from the first SETUP and made every descriptor request fail
-/// (Windows Code 43). XORing `current ^ desired` instead yields the
-/// desired status from any starting state — identical to the vendor's
-/// result on their call sites, and safe on ours.
+/// The status field toggles on written 1s: each written 1 flips that
+/// bit, each written 0 leaves it. Landing on `desired` therefore needs
+/// the written bits to be the DELTA (`current ^ desired`) — not
+/// `desired` itself. (The vendor `USB_SET_TXSTS` macro gets this right
+/// by accident of composition: `epsts = reg & MASK` already carries the
+/// current status, so `epsts ^= new_sts` leaves the delta in the field.
+/// Writing the delta against the raw register — or equivalently writing
+/// `desired` against the masked register — double-cancels and toggles
+/// by `desired`: NAK (10) toggled by VALID (11) = 01 = STALL, which
+/// stalled EP0's receiver at init through five rounds of "fixes".)
 fn set_tx_status(index: usize, desired: u32) {
     let raw = ept_read(index);
     let current = (raw >> 4) & 0b11;
-    let value = (raw & EPT_TX_MASK) ^ ((current ^ desired) << 4);
-    ept_write(index, value | EPT_RXTC | EPT_TXTC);
+    // Invariant: everything except the toggle fields (status bits and
+    // data toggles) — a written 0 leaves a toggle field unchanged.
+    let invariant = raw & EPT_BIT_MASK;
+    let toggle = (current ^ desired) << 4; // TXSTS lives in bits 5:4
+    ept_write(index, invariant | toggle | EPT_W0C_MASK);
 }
 
 /// Set one endpoint's RX status to `desired`, from any current state
-/// (semantics as [`set_tx_status`).
+/// (semantics as [`set_tx_status`]).
 fn set_rx_status(index: usize, desired: u32) {
     let raw = ept_read(index);
     let current = (raw >> 12) & 0b11;
-    let value = (raw & EPT_RX_MASK) ^ ((current ^ desired) << 12);
-    ept_write(index, value | EPT_RXTC | EPT_TXTC);
+    let invariant = raw & EPT_BIT_MASK;
+    let toggle = (current ^ desired) << 12; // RXSTS lives in bits 13:12
+    ept_write(index, invariant | toggle | EPT_W0C_MASK);
 }
 
 /// Vendor `USB_CLEAR_TXTC(eptn)`.

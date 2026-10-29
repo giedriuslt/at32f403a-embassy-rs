@@ -293,7 +293,7 @@ pub fn usb_pll_plan(hext_hz: u32) -> Option<UsbPllPlan> {
         if pll_in == 0 || !hext_hz.is_multiple_of(2) && source == PllSource::HextDiv2 {
             continue;
         }
-        if pll_in > 16_000_000 || pll_in < 1_000_000 {
+        if !(1_000_000..=16_000_000).contains(&pll_in) {
             continue;
         }
         for mult in 2u16..=64 {
