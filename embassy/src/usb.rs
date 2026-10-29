@@ -214,6 +214,14 @@ fn packet_half(offset: usize) -> u16 {
     unsafe { PACKET_RAM.add(offset / 2).read_volatile() }
 }
 
+/// Write a 32-bit value as two little-endian halfwords (the vendor's
+/// table macros write u32).
+#[inline]
+fn set_packet_word(offset: usize, value: u32) {
+    set_packet_half(offset, value as u16);
+    set_packet_half(offset + 2, (value >> 16) as u16);
+}
+
 #[inline]
 fn set_packet_half(offset: usize, value: u16) {
     // SAFETY: offsets are within the 512-byte packet SRAM by construction.
@@ -249,9 +257,12 @@ fn write_packet(offset: usize, bytes: &[u8]) {
     }
 }
 
-/// Vendor `USB_SET_TXLEN`: plain byte count.
+/// Vendor `USB_SET_TXLEN`: a 32-bit write whose upper halfword is zero.
+/// The upper halves of the table fields must be driven to 0 like the
+/// vendor does — packet SRAM is not guaranteed to zero-initialize, and a
+/// stale upper half in a count field feeds the DMA engine garbage.
 fn set_tx_count(slot: usize, len: u16) {
-    set_packet_half(slot + 4, len);
+    set_packet_word(slot + 4, u32::from(len));
 }
 
 /// Vendor `USB_GET_RX_LEN`: received byte count after an OUT.
@@ -278,7 +289,7 @@ fn rx_count_encoding(len: u16) -> u16 {
 
 /// Vendor `USB_SET_RXLEN(eptn, len)` for a single-buffer endpoint.
 fn set_rx_count(slot: usize, len: u16) {
-    set_packet_half(slot + 12, rx_count_encoding(len));
+    set_packet_word(slot + 12, u32::from(rx_count_encoding(len)));
 }
 
 // --- Descriptors (CDC 1.1, single function, bus-powered) ---
@@ -527,8 +538,8 @@ fn open_ept(index: usize, trans_type: u32) {
     // offsets here made the hardware DMA every packet to a different
     // address than the driver read, so SETUPs landed in space and the
     // "descriptor" the host received was garbage from byte 0x40.
-    set_packet_half(SLOT[index], (BUF_SLOT_TX[index] / 2) as u16);
-    set_packet_half(SLOT[index] + 8, (BUF_SLOT_RX[index] / 2) as u16);
+    set_packet_word(SLOT[index], BUF_SLOT_TX[index] as u32 / 2);
+    set_packet_word(SLOT[index] + 8, BUF_SLOT_RX[index] as u32 / 2);
     set_ept_slot(index);
     set_trans_type(index, trans_type);
     set_rx_count(SLOT[index], EP_SIZE);
