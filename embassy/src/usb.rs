@@ -522,8 +522,21 @@ fn open_ept(index: usize, trans_type: u32) {
 /// unmasks `USBFS_H_CAN1_TX` or `USBFS_L_CAN1_RX0` with a handler calling
 /// [`on_interrupt`]). [`enable_usb_clock`] must have run.
 pub unsafe fn init() {
-    // Disconnect during setup (vendor usb_disconnect: DISUSB=1, PUO=1).
     critical_section::with(|_| {
+        // Own clock setup (vendor BSP order: CRM enables the USB register
+        // clock before usb_dev_init). Doing it here — not in the board's
+        // clock module — makes it impossible to attach without the cell
+        // being clocked: unclocked register writes are silent no-ops, and
+        // the D+ pull-up would never assert.
+        // SAFETY: forwarded from this constructor's exclusive-startup contract.
+        let crm = unsafe { crate::pac::at32f403a::CRM::steal() };
+        // Plain 512-byte packet SRAM (MISC1.USBBUFS = 0).
+        crm.misc1().modify(|_, w| w.usbbufs().bit(false));
+        crm.apb1en().modify(|_, w| w.usb().bit(true));
+        crm.apb1rst().modify(|_, w| w.usb().bit(true));
+        crm.apb1rst().modify(|_, w| w.usb().bit(false));
+
+        // Disconnect during setup (vendor usb_disconnect: DISUSB=1, PUO=1).
         reg_write(CTRL, reg_read(CTRL) | CTRL_DISUSB);
         reg_write(CFG, reg_read(CFG) | CFG_PUO);
         // Vendor usb_dev_init: core out of reset, flags cleared, buffer

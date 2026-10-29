@@ -286,10 +286,16 @@ pub unsafe fn configure_hick48() -> Result<Clocks, Error> {
     }
 
     critical_section::with(|_| {
-        // HICK runs at 48 MHz instead of the reset 8 MHz (vendor
-        // CRM_HICK48_NODIV); SCLK follows HICK, so the whole system moves
-        // to 48 MHz with the dividers at 1. Flash stays zero-wait.
+        // Vendor crm_usb_clock_source_select(HICK) +
+        // crm_hick_sclk_frequency_select(48MHZ), verbatim:
+        // 1. HICK runs at 48 MHz instead of the reset 8 MHz (MISC1.HICKDIV
+        //    = CRM_HICK48_NODIV).
+        // 2. MISC3.HICK_TO_SCLK routes the 48 MHz HICK to SCLK — without
+        //    this bit, "SCLK from HICK" is the pre-divided 8 MHz.
+        // 3. MISC3.HICK_TO_USB feeds the USB cell from the same HICK (no
+        //    USBDIV involved).
         crm.misc1().modify(|_, w| w.hickdiv().bit(true));
+        crm.misc3().modify(|_, w| w.hick_to_sclk().bit(true));
         crm.cfg().modify(|_, w| {
             w.sclksel().variant(SCLKSEL_A::Hick);
             w.ahbdiv().variant(AHBDIV_A::Sclk);
@@ -297,7 +303,6 @@ pub unsafe fn configure_hick48() -> Result<Clocks, Error> {
             w.apb2div().variant(APB1DIV_A::Hclk);
             w
         });
-        // USB clock = HICK 48 MHz directly (no USBDIV involved).
         crm.misc3().modify(|_, w| w.hick_to_usb().bit(true));
     });
 
