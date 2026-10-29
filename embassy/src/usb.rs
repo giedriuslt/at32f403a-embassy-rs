@@ -1,30 +1,36 @@
 //! USB full-speed device (CDC ACM virtual COM port) for the AT32F403A's
-//! USBFS cell — an F103-style device core: per-endpoint registers, a buffer
-//! table in packet SRAM, and F103 toggle semantics on the endpoint status
-//! and TC bits.
+//! USBFS cell, mirroring the vendor `at32f403a_407_usb.c` /
+//! `usbd_int.c` register sequences exactly.
 //!
-//! Everything here follows the vendor `at32f403a_407_usb.c/.h`:
-//! - `usb_dev_init`: CTRL.CSRST off, INTSTS cleared, BUFTBL=0, DEVADDR=0x80
-//!   (CEN + address 0), RST/TC interrupt enables.
-//! - `usb_connect`/`usb_disconnect`: the D+ 1.5 kΩ pull-up is enabled with
-//!   CFG.PUO = **0** (active-low, vendor-written).
-//! - `USB_SET_TXSTS`/`USB_SET_RXSTS`: the new status is XOR-toggled into
-//!   the masked register; EPTn TC flags (TXTC/SETUPTC/RXTC) are F103-style
-//!   toggle bits — writing back the read value clears the set ones.
-//! - INTSTS flags are write-zero-to-clear (`usb_flag_clear` writes `~flag`).
-//! - Buffer table: slot *n* sits at packet-SRAM byte offset `n * 16`
-//!   (`(BUFTBL + n*8 + x) * 2` in the vendor macros): TXADDR +0, TXCOUNT
-//!   +4, RXADDR +8, RXCOUNT +12. EPTn.EPTADDR holds the endpoint's slot
-//!   number. RX counts use the F103 block encoding (vendor BLK2/BLK32);
+//! Core facts taken from the vendor source (this cell is F103-*like*, not
+//! F103-identical):
+//! - **EPTn TC flags (TXTC/RXTC/SETUPTC) are write-zero-to-clear**:
+//!   `USB_CLEAR_TXTC(eptn) = (ept &= 0xFF7F & 0x8F8F)`. The clear also
+//!   zeroes the endpoint's own status bits, which is the invariant that
+//!   makes the status-set idiom work (below).
+//! - **Endpoint status (TXSTS bits 5:4, RXSTS bits 13:12) is set with an
+//!   XOR**: `USB_SET_TXSTS` keeps the masked register, toggles the status
+//!   bits by the new encoding, and ORs the TC bits back to 1 (keeping
+//!   them). Because the TC clear reset the status to DISABLE, "toggling"
+//!   from DISABLE yields the intended status.
+//! - **INTSTS is write-zero-to-clear**: `usb_flag_clear` writes `~flag`.
+//!   `INTSTS.TC` (bit 15) clears when the endpoint's own TC clears, so the
+//!   IRQ drains pending endpoint events in a loop.
+//! - **Buffer table**: slot *n* at packet-SRAM byte offset `n * 16`, with
+//!   TXADDR at +0, TXCOUNT at +4, RXADDR at +8, RXCOUNT at +12. The
+//!   address fields MUST be programmed (the vendor's reset handler calls
+//!   `usbd_ept_buf_custom_define` for both EP0 directions) — leaving them
+//!   at 0 points every buffer at the table itself.
+//! - RX counts use the F103 block encoding (`USB_SET_RXLEN`: BLK2/BLK32);
 //!   after an OUT transaction the RXCOUNT slot's low 10 bits hold the
 //!   received bytes (`USB_GET_RX_LEN` masks `& 0x3ff`).
-//! - `USB_PACKET_BUFFER_ADDRESS` = 0x4000_6000 (512 bytes while CRM
-//!   MISC1.USBBUFS is 0).
+//! - SETUP arrives as EPT0 SETUPTC *and* RXTC; the vendor reads the setup
+//!   packet, clears RXTC, and dispatches.
+//! - Packet SRAM at `0x4000_6000` (512 bytes, CRM MISC1.USBBUFS = 0).
+//! - The D+ pull-up enables with CFG.PUO = 0 (active-low, vendor-written).
 //!
 //! One CDC function is served: EP0 control, EP1 bulk IN/OUT. Shared state
-//! sits behind a critical-section mutex taken by both the interrupt
-//! handler and the task API; the task side polls, so bring-up needs no
-//! interrupt-priority choreography beyond unmasking the vector.
+//! sits behind a critical-section mutex; the task side polls.
 
 use core::cell::RefCell;
 
@@ -33,8 +39,15 @@ use embassy_sync::blocking_mutex::Mutex;
 
 /// USBFS register base.
 const USBFS_BASE: usize = 0x4000_5c00;
-/// Packet SRAM base while CRM MISC1.USBBUFS is 0 (512 bytes).
+/// Packet SRAM base (CRM MISC1.USBBUFS = 0).
 const PACKET_RAM: *mut u16 = 0x4000_6000 as *mut u16;
+
+// Register offsets.
+const CTRL: usize = 0x40;
+const INTSTS: usize = 0x44;
+const DEVADDR: usize = 0x4c;
+const BUFTBL: usize = 0x50;
+const CFG: usize = 0x60;
 
 // CTRL bits.
 const CTRL_CSRST: u32 = 1 << 0;
@@ -47,101 +60,132 @@ const CFG_PUO: u32 = 1 << 1;
 const DEVADDR_CEN: u32 = 1 << 7;
 // INTSTS bits (write-zero-to-clear).
 const INTS_EPT_NUM: u32 = 0xf;
+#[allow(dead_code)]
 const INTS_INOUT: u32 = 1 << 4;
 const INTS_RST: u32 = 1 << 10;
 const INTS_TC: u32 = 1 << 15;
-// EPTn bits.
-const EPTADDR_MASK: u32 = 0xf;
-const TXSTS_OFFSET: u32 = 4; // bits 5:4
-#[allow(dead_code)]
-const TXTC: u32 = 1 << 7;
-const TRANS_TYPE_CONTROL: u32 = 0b01 << 9;
-const TRANS_TYPE_BULK: u32 = 0b00 << 9;
-const SETUPTC: u32 = 1 << 11;
-const RXSTS_OFFSET: u32 = 12; // bits 13:12
-#[allow(dead_code)]
-const RXTC: u32 = 1 << 15;
-/// Vendor `USB_TX_MASK`: status plus all preserved bits.
-const EPT_TX_MASK: u32 = 0x30 | 0x8f8f;
-/// Vendor `USB_RX_MASK`.
-const EPT_RX_MASK: u32 = 0x3000 | 0x8f8f;
 
-/// Endpoint status encodings (bits 1:0 of the field).
+// EPTn bits (vendor constants, verbatim).
+const EPT_EPTADDR: u32 = 0xf;
+const EPT_TXSTS: u32 = 0x30; // bits 5:4
+const EPT_TXTC: u32 = 0x80; // bit 7
+const EPT_EXF: u32 = 0x100; // bit 8
+const EPT_TRANS_TYPE: u32 = 0x600; // bits 10:9
+const EPT_SETUPTC: u32 = 0x800; // bit 11
+const EPT_RXSTS: u32 = 0x3000; // bits 13:12
+const EPT_RXTC: u32 = 0x8000; // bit 15
+
+/// Vendor `USB_EPT_BIT_MASK` (fields preserved across status writes).
+const EPT_BIT_MASK: u32 =
+    EPT_TXTC | EPT_SETUPTC | EPT_EPTADDR | EPT_EXF | EPT_RXTC | EPT_TRANS_TYPE;
+/// Vendor `USB_TX_MASK` / `USB_RX_MASK`.
+const EPT_TX_MASK: u32 = EPT_TXSTS | EPT_BIT_MASK;
+const EPT_RX_MASK: u32 = EPT_RXSTS | EPT_BIT_MASK;
+/// Vendor `USB_CLEAR_TXTC` / `USB_CLEAR_RXTC` / `USB_CLEAR_SETUPTC` masks
+/// (the value ANDed into the register: zeros clear the flag and reset the
+/// endpoint's own status field to DISABLE).
+const CLEAR_TXTC_MASK: u32 = 0xff7f & EPT_BIT_MASK;
+const CLEAR_RXTC_MASK: u32 = 0x7fff & EPT_BIT_MASK;
+const CLEAR_SETUPTC_MASK: u32 = 0xf7ff & EPT_BIT_MASK;
+
+// Status encodings.
 #[allow(dead_code)]
 const STS_DISABLE: u32 = 0b00;
 const STS_STALL: u32 = 0b01;
 const STS_NAK: u32 = 0b10;
 const STS_VALID: u32 = 0b11;
 
+// Transfer types.
+const TYPE_BULK: u32 = 0b00 << 9;
+const TYPE_CONTROL: u32 = 0b01 << 9;
+
 /// Max packet size everywhere (full-speed bulk).
 const EP_SIZE: u16 = 64;
 
-/// Buffer-table slots (byte offset = endpoint * 16; TXCOUNT at +4,
-/// RXCOUNT at +12) and packet buffers (byte offsets inside packet SRAM),
-/// 2 entries + 4 buffers = 288 bytes.
-const SLOT_EP0: usize = 0x00;
-const SLOT_EP1: usize = 0x10;
+/// Buffer-table slots (byte offset = endpoint * 16: TXADDR +0, TXCOUNT
+/// +4, RXADDR +8, RXCOUNT +12) and packet buffers. 2 slots + 4 × 64-byte
+/// buffers = 288 bytes of the 512 available.
+const SLOT: [usize; 2] = [0x00, 0x10];
 const BUF_EP0_TX: usize = 0x20;
 const BUF_EP0_RX: usize = 0x60;
 const BUF_EP1_TX: usize = 0xa0;
 const BUF_EP1_RX: usize = 0xe0;
+/// TX/RX packet-buffer addresses per endpoint.
+const BUF_SLOT_TX: [usize; 2] = [BUF_EP0_TX, BUF_EP1_TX];
+const BUF_SLOT_RX: [usize; 2] = [BUF_EP0_RX, BUF_EP1_RX];
 
 // --- Raw register access ---
 
 #[inline]
-fn reg(offset: usize) -> *mut u32 {
+fn reg_ptr(offset: usize) -> *mut u32 {
     (USBFS_BASE + offset) as *mut u32
 }
 
 #[inline]
 fn reg_read(offset: usize) -> u32 {
     // SAFETY: offsets are inside the USBFS register block by construction.
-    unsafe { reg(offset).read_volatile() }
+    unsafe { reg_ptr(offset).read_volatile() }
 }
 
 #[inline]
 fn reg_write(offset: usize, value: u32) {
     // SAFETY: offsets are inside the USBFS register block by construction.
     unsafe {
-        reg(offset).write_volatile(value);
+        reg_ptr(offset).write_volatile(value);
     }
 }
 
-fn ept_raw(index: usize) -> u32 {
+#[inline]
+fn ept_read(index: usize) -> u32 {
     reg_read(index * 4)
 }
 
-fn set_ept_raw(index: usize, value: u32) {
+#[inline]
+fn ept_write(index: usize, value: u32) {
     reg_write(index * 4, value);
 }
 
-/// Set one endpoint's TX status to `desired`.
-///
-/// The F103-style status field *toggles* on write: the written bits flip
-/// the field. The vendor's `USB_SET_TXSTS` therefore XORs the intended
-/// status against the current one before writing (`epsts ^= DTS0/DTS1`).
-/// Treating the argument as an absolute value instead leaves the endpoint
-/// in an unintended state — NAK to "VALID" writes `10 ^ 11 = 01`, a stall,
-/// which the host sees as a dead descriptor request (Windows Code 43).
+/// Vendor `USB_SET_TXSTS(eptn, new_sts)`: toggle the status bits within
+/// the masked register; TC bits written back as 1 keep their flags.
+/// `desired` is the unshifted two-bit status encoding.
 fn set_tx_status(index: usize, desired: u32) {
-    let raw = ept_raw(index);
-    let current = (raw >> TXSTS_OFFSET) & 0b11;
-    let value = (raw & EPT_TX_MASK) ^ ((current ^ desired) << TXSTS_OFFSET);
-    set_ept_raw(index, value);
+    let mut value = ept_read(index) & EPT_TX_MASK;
+    value ^= desired << 4;
+    ept_write(index, value | EPT_RXTC | EPT_TXTC);
 }
 
-/// Set one endpoint's RX status to `desired` (toggle semantics as above).
+/// Vendor `USB_SET_RXSTS(eptn, new_sts)`.
 fn set_rx_status(index: usize, desired: u32) {
-    let raw = ept_raw(index);
-    let current = (raw >> RXSTS_OFFSET) & 0b11;
-    let value = (raw & EPT_RX_MASK) ^ ((current ^ desired) << RXSTS_OFFSET);
-    set_ept_raw(index, value);
+    let mut value = ept_read(index) & EPT_RX_MASK;
+    value ^= desired << 12;
+    ept_write(index, value | EPT_RXTC | EPT_TXTC);
 }
 
-/// Clear the endpoint's TC flags (TXTC/SETUPTC/RXTC are toggle bits:
-/// writing the read value flips each set flag to zero).
-fn clear_ept_tc(index: usize) {
-    set_ept_raw(index, ept_raw(index));
+/// Vendor `USB_CLEAR_TXTC(eptn)`.
+fn clear_txtc(index: usize) {
+    ept_write(index, ept_read(index) & CLEAR_TXTC_MASK);
+}
+
+/// Vendor `USB_CLEAR_RXTC(eptn)`.
+fn clear_rxtc(index: usize) {
+    ept_write(index, ept_read(index) & CLEAR_RXTC_MASK);
+}
+
+/// Vendor `USB_CLEAR_SETUPTC(eptn)`.
+fn clear_setuptc(index: usize) {
+    ept_write(index, ept_read(index) & CLEAR_SETUPTC_MASK);
+}
+
+/// Vendor `USB_SET_TRANS_TYPE(eptn, type)`.
+fn set_trans_type(index: usize, trans_type: u32) {
+    let value = (ept_read(index) & EPT_BIT_MASK & !EPT_TRANS_TYPE) | trans_type;
+    ept_write(index, value);
+}
+
+/// Vendor `USB_SET_EPT_ADDRESS(eptn, address)`: the slot number.
+fn set_ept_slot(index: usize) {
+    let value = (ept_read(index) & EPT_BIT_MASK & !EPT_EPTADDR) | index as u32;
+    ept_write(index, value);
 }
 
 // --- Packet SRAM access ---
@@ -175,6 +219,7 @@ fn packet_bytes(offset: usize, len: usize) -> [u8; 64] {
     out
 }
 
+/// Vendor `usb_write_packet`: bytes into packet SRAM.
 fn write_packet(offset: usize, bytes: &[u8]) {
     let mut i = 0;
     while i + 1 < bytes.len() {
@@ -186,11 +231,21 @@ fn write_packet(offset: usize, bytes: &[u8]) {
     }
 }
 
-/// F103-style RX buffer count encoding (vendor BLK2/BLK32).
+/// Vendor `USB_SET_TXLEN`: plain byte count.
+fn set_tx_count(slot: usize, len: u16) {
+    set_packet_half(slot + 4, len);
+}
+
+/// Vendor `USB_GET_RX_LEN`: received byte count after an OUT.
+fn rx_count(slot: usize) -> u16 {
+    packet_half(slot + 12) & 0x3ff
+}
+
+/// Vendor `USB_SET_RXLEN`: F103 block encoding (BLK2/BLK32).
 fn rx_count_encoding(len: u16) -> u16 {
     if len > 62 {
         let mut blocks = len >> 5;
-        if len.is_multiple_of(0x20) {
+        if len & 0x1f == 0 {
             blocks -= 1;
         }
         (blocks << 10) | 0x8000
@@ -203,12 +258,9 @@ fn rx_count_encoding(len: u16) -> u16 {
     }
 }
 
-fn set_tx_len(slot: usize, len: u16) {
-    set_packet_half(slot + 4, len);
-}
-
-fn rx_received(slot: usize) -> u16 {
-    packet_half(slot + 12) & 0x3ff
+/// Vendor `USB_SET_RXLEN(eptn, len)` for a single-buffer endpoint.
+fn set_rx_count(slot: usize, len: u16) {
+    set_packet_half(slot + 12, rx_count_encoding(len));
 }
 
 // --- Descriptors (CDC 1.1, single function, bus-powered) ---
@@ -244,23 +296,22 @@ const CONFIG_DESC: [u8; 60] = [
 
 const LANGID_DESC: [u8; 4] = [0x04, 0x03, 0x09, 0x04];
 
-/// UTF-16-LE string descriptor (up to 16 characters).
+/// UTF-16-LE string descriptor (up to 18 characters, bLength matches).
 const fn string_desc(s: &str) -> [u8; 40] {
     let mut out = [0u8; 40];
-    // bLength covers only the characters actually stored (18 max here).
     let chars = if s.len() > 18 { 18 } else { s.len() };
     out[0] = 2 + 2 * chars as u8;
     out[1] = 0x03;
     let bytes = s.as_bytes();
     let mut i = 0;
-    while 2 + 2 * i + 1 < out.len() && i < bytes.len() && i < chars {
+    while i < chars {
         out[2 + 2 * i] = bytes[i];
         i += 1;
     }
     out
 }
 
-const MANUFACTURER_DESC: [u8; 40] = string_desc("FNB58 open firmware");
+const MANUFACTURER_DESC: [u8; 40] = string_desc("FNB58 open");
 const PRODUCT_DESC: [u8; 40] = string_desc("FNB58 serial");
 
 // --- Control-transfer state ---
@@ -269,7 +320,7 @@ const PRODUCT_DESC: [u8; 40] = string_desc("FNB58 serial");
 enum CtrlState {
     /// Armed for the next SETUP.
     Idle,
-    /// Streaming a descriptor to the host.
+    /// Streaming a descriptor to the host (multi-chunk).
     DataIn,
     /// Collecting SET_LINE_CODING data.
     DataOut { left: usize },
@@ -310,10 +361,7 @@ impl Descriptor {
                 1 => Self::Manufacturer,
                 _ => Self::Product,
             }),
-            _ => {
-                let _ = index;
-                None
-            }
+            _ => None,
         }
     }
 }
@@ -438,6 +486,26 @@ pub unsafe fn enable_usb_clock(pll_hz: u32) -> Result<(), Error> {
     Ok(())
 }
 
+/// Open one endpoint with its packet buffers (vendor `usb_ept_open` for a
+/// single-buffered endpoint, both buffer addresses pre-programmed as the
+/// vendor's `usbd_ept_buf_custom_define` does in the reset handler).
+fn open_ept(index: usize, trans_type: u32) {
+    // Vendor default-init: the register starts from zero, which makes the
+    // XOR status idiom deterministic (DISABLE -> NAK).
+    ept_write(index, 0);
+    // Buffer addresses MUST be in the table before the endpoint is armed;
+    // reset leaves them at 0, which aliases every buffer onto the table.
+    set_packet_half(SLOT[index], BUF_SLOT_TX[index] as u16);
+    set_packet_half(SLOT[index] + 8, BUF_SLOT_RX[index] as u16);
+    set_ept_slot(index);
+    set_trans_type(index, trans_type);
+    set_rx_count(SLOT[index], EP_SIZE);
+    set_tx_count(SLOT[index], 0);
+    // Statuses NAK (XOR from DISABLE).
+    set_tx_status(index, STS_NAK);
+    set_rx_status(index, STS_NAK);
+}
+
 /// Bring up the CDC device and attach (D+ pull-up on).
 ///
 /// # Safety
@@ -448,57 +516,27 @@ pub unsafe fn enable_usb_clock(pll_hz: u32) -> Result<(), Error> {
 pub unsafe fn init() {
     // Disconnect during setup (vendor usb_disconnect: DISUSB=1, PUO=1).
     critical_section::with(|_| {
-        let ctrl = reg_read(0x40);
-        reg_write(0x40, ctrl | CTRL_DISUSB);
-        let cfg = reg_read(0x60);
-        reg_write(0x60, cfg | CFG_PUO);
-        // Core out of reset; flags cleared; buffer table at 0; device
-        // enabled at address 0 (vendor devaddr = 0x80).
-        let ctrl = reg_read(0x40);
-        reg_write(0x40, ctrl & !CTRL_CSRST);
-        reg_write(0x44, 0);
-        reg_write(0x50, 0); // BUFTBL
-        reg_write(0x4c, DEVADDR_CEN); // DEVADDR
-        // Interrupt enables: transfer complete and bus reset only.
-        let ctrl = reg_read(0x40);
-        reg_write(0x40, ctrl | CTRL_TCIEN | CTRL_RSTIEN);
-        // EP0 control and EP1 bulk, both directions NAK.
-        configure_ept(0, TRANS_TYPE_CONTROL);
-        configure_ept(1, TRANS_TYPE_BULK);
-        set_packet_half(SLOT_EP0 + 12, rx_count_encoding(EP_SIZE));
-        set_packet_half(SLOT_EP1 + 12, rx_count_encoding(EP_SIZE));
+        reg_write(CTRL, reg_read(CTRL) | CTRL_DISUSB);
+        reg_write(CFG, reg_read(CFG) | CFG_PUO);
+        // Vendor usb_dev_init: core out of reset, flags cleared, buffer
+        // table at 0, device enabled at address 0 (devaddr = 0x80),
+        // RST/TC interrupt enables.
+        reg_write(CTRL, reg_read(CTRL) & !CTRL_CSRST);
+        reg_write(INTSTS, 0);
+        reg_write(BUFTBL, 0);
+        reg_write(DEVADDR, DEVADDR_CEN);
+        reg_write(CTRL, reg_read(CTRL) | CTRL_TCIEN | CTRL_RSTIEN);
+        open_ept(0, TYPE_CONTROL);
+        open_ept(1, TYPE_BULK);
+        // Arm EP0 reception for the first SETUP (vendor reset handler
+        // opens EP0 OUT with RX valid).
         set_rx_status(0, STS_VALID);
     });
     // Connect: the pull-up is active-low (vendor usb_connect).
     critical_section::with(|_| {
-        let ctrl = reg_read(0x40);
-        reg_write(0x40, ctrl & !CTRL_DISUSB);
-        let cfg = reg_read(0x60);
-        reg_write(0x60, cfg & !CFG_PUO);
+        reg_write(CTRL, reg_read(CTRL) & !CTRL_DISUSB);
+        reg_write(CFG, reg_read(CFG) & !CFG_PUO);
     });
-}
-
-fn configure_ept(index: usize, trans_type: u32) {
-    // EPTADDR = the endpoint's slot number; statuses NAK; toggle-flag TCs
-    // left as-is (the write-back idiom below preserves them).
-    let mut value = ept_raw(index);
-    value = (value & !(EPTADDR_MASK | 0x600)) | (index as u32) | trans_type;
-    set_ept_raw(index, value);
-    set_tx_status(index, STS_NAK);
-    set_rx_status(index, STS_NAK);
-}
-
-fn arm_rx_buffer(slot: usize, index: usize) {
-    set_packet_half(slot + 12, rx_count_encoding(EP_SIZE));
-    set_rx_status(index, STS_VALID);
-}
-
-fn idle_ep0() {
-    STATE.lock(|cell| {
-        let mut state = cell.borrow_mut();
-        state.ctrl = CtrlState::Idle;
-    });
-    arm_rx_buffer(SLOT_EP0, 0);
 }
 
 fn configured() -> bool {
@@ -521,7 +559,7 @@ pub async fn write(bytes: &[u8]) -> Result<(), Error> {
             }
             let chunk_len = rest.len().min(EP_SIZE as usize);
             write_packet(BUF_EP1_TX, &rest[..chunk_len]);
-            set_tx_len(SLOT_EP1, chunk_len as u16);
+            set_tx_count(SLOT[1], chunk_len as u16);
             set_tx_status(1, STS_VALID);
             state.tx_armed = true;
             true
@@ -559,80 +597,117 @@ pub async fn read(buffer: &mut [u8]) -> Result<usize, Error> {
 
 // --- Interrupt handling ---
 
-/// The USBFS interrupt: bus reset, SETUP on EP0, and transfer completions
-/// routed through `INTSTS.TC` + `EPT_NUM`/`INOUT`. The board's
+/// The USBFS interrupt, mirroring the vendor `usbd_irq_handler` flow: the
+/// INTSTS TC flag is level-derived from the per-endpoint TC bits (drain
+/// them in a loop); the reset flag is write-zero-cleared. The board's
 /// `USBFS_H_CAN1_TX` (or `USBFS_L_CAN1_RX0`) handler calls this.
 pub fn on_interrupt() {
-    let raw = reg_read(0x44);
-
-    if raw & INTS_RST != 0 {
-        critical_section::with(|_| {
-            reg_write(0x4c, DEVADDR_CEN);
-            configure_ept(0, TRANS_TYPE_CONTROL);
-            configure_ept(1, TRANS_TYPE_BULK);
-            set_packet_half(SLOT_EP0 + 12, rx_count_encoding(EP_SIZE));
-            set_packet_half(SLOT_EP1 + 12, rx_count_encoding(EP_SIZE));
-            set_rx_status(0, STS_VALID);
-            STATE.lock(|cell| *cell.borrow_mut() = State::new());
-        });
-        // Write-zero-to-clear: 1s keep, 0 clears RST.
-        reg_write(0x44, raw | INTS_RST);
-    }
-
-    // SETUP arrives on EPT0 (SETUPTC) possibly with the TC flag; service
-    // it before any completion handling.
-    if ept_raw(0) & SETUPTC != 0 {
-        clear_ept_tc(0);
-        handle_setup();
-        reg_write(0x44, reg_read(0x44) | INTS_TC);
-        return;
-    }
-
-    if raw & INTS_TC != 0 {
-        let ept_num = (raw & INTS_EPT_NUM) as usize;
-        let is_in = raw & INTS_INOUT != 0;
-        match (ept_num, is_in) {
-            (0, true) => ep0_in(),
-            (0, false) => ep0_out(),
-            (1, true) => {
-                clear_ept_tc(1);
-                STATE.lock(|cell| {
-                    let mut state = cell.borrow_mut();
-                    state.tx_armed = false;
-                });
-                set_tx_status(1, STS_NAK);
-            }
-            (1, false) => {
-                clear_ept_tc(1);
-                let len = rx_received(SLOT_EP1) as usize;
-                let payload = packet_bytes(BUF_EP1_RX, len);
-                STATE.lock(|cell| cell.borrow_mut().rx_ring.push(&payload[..len]));
-                arm_rx_buffer(SLOT_EP1, 1);
-            }
-            _ => {}
+    // Endpoint transfer completions (vendor usbd_ept_loop_handler): each
+    // per-endpoint handler clears its TC, which drops INTSTS.TC.
+    let mut rounds = 0;
+    while reg_read(INTSTS) & INTS_TC != 0 && rounds < 8 {
+        rounds += 1;
+        let sts = reg_read(INTSTS);
+        let ept_num = (sts & INTS_EPT_NUM) as usize;
+        if ept_num > 1 {
+            // Should not happen; clear the endpoint's flags and move on.
+            clear_txtc(ept_num);
+            clear_rxtc(ept_num);
+            continue;
         }
-        reg_write(0x44, reg_read(0x44) | INTS_TC);
+        eptn_handler(ept_num);
+    }
+
+    // If the core's TC deassertion lags (or a stray TC remains), force
+    // the INTSTS flag clear as well; w0c semantics make this harmless
+    // when the level already dropped.
+    if reg_read(INTSTS) & INTS_TC != 0 {
+        reg_write(INTSTS, reg_read(INTSTS) & !INTS_TC);
+    }
+
+    if reg_read(INTSTS) & INTS_RST != 0 {
+        // Write-zero-to-clear (usb_flag_clear writes ~flag).
+        reg_write(INTSTS, reg_read(INTSTS) & !INTS_RST);
+        bus_reset();
     }
 }
 
+/// Vendor `usbd_eptn_handler`: IN completion, else SETUP, else OUT.
+fn eptn_handler(index: usize) {
+    let ept_val = ept_read(index);
+
+    if ept_val & EPT_TXTC != 0 {
+        // IN transaction completed.
+        clear_txtc(index);
+        if index == 0 {
+            ep0_in();
+        } else {
+            // Bulk IN done: NAK until the task arms the next packet.
+            set_tx_status(1, STS_NAK);
+            STATE.lock(|cell| cell.borrow_mut().tx_armed = false);
+        }
+        return;
+    }
+
+    if ept_val & EPT_SETUPTC != 0 {
+        // SETUP transaction: read the packet, clear the OUT-side flags,
+        // dispatch. (The read must happen before the clears: the buffer
+        // content stays only until the endpoint is re-armed.)
+        let len = rx_count(SLOT[0]) as usize;
+        let setup = packet_bytes(BUF_EP0_RX, len.min(8));
+        clear_rxtc(0);
+        clear_setuptc(0);
+        handle_setup(&setup);
+        return;
+    }
+
+    if ept_val & EPT_RXTC != 0 {
+        // OUT transaction completed.
+        clear_rxtc(index);
+        let len = rx_count(SLOT[index]) as usize;
+        let payload = packet_bytes(BUF_SLOT_RX[index], len);
+        if index == 0 {
+            ep0_out(&payload, len);
+        } else {
+            STATE.lock(|cell| cell.borrow_mut().rx_ring.push(&payload[..len]));
+            // Re-arm bulk reception (the clear reset the status to
+            // DISABLE; set VALID from DISABLE).
+            set_rx_count(SLOT[1], EP_SIZE);
+            set_rx_status(1, STS_VALID);
+        }
+    }
+}
+
+/// Bus reset: address 0, re-open both endpoints, arm EP0 (vendor
+/// `usbd_reset_handler`).
+fn bus_reset() {
+    critical_section::with(|_| {
+        reg_write(DEVADDR, DEVADDR_CEN);
+        open_ept(0, TYPE_CONTROL);
+        open_ept(1, TYPE_BULK);
+        set_rx_status(0, STS_VALID);
+        STATE.lock(|cell| *cell.borrow_mut() = State::new());
+    });
+}
+
+/// Vendor `usbd_core_in_handler` for EP0: multi-chunk descriptor
+/// streaming, then the status ZLP OUT; address applied after STATUS_IN.
 fn ep0_in() {
-    clear_ept_tc(0);
+    let mut follow: Option<(&'static [u8], usize, usize)> = None;
     let mut apply_address = 0u8;
-    let mut chunk: Option<(&'static [u8], usize)> = None;
     STATE.lock(|cell| {
         let mut state = cell.borrow_mut();
         match state.ctrl {
             CtrlState::DataIn => {
                 if state.ctrl_sent >= state.ctrl_total {
-                    // Data stage complete: status is a ZLP OUT from host.
+                    // Data stage done: status is a ZLP OUT from the host.
                     state.ctrl = CtrlState::StatusOut;
-                    arm_rx_buffer(SLOT_EP0, 0);
+                    set_rx_count(SLOT[0], EP_SIZE);
+                    set_rx_status(0, STS_VALID);
                 } else {
-                    let end = state
-                        .ctrl_sent
-                        .saturating_add(EP_SIZE as usize)
-                        .min(state.ctrl_total);
-                    chunk = Some((state.ctrl_desc.bytes(), end));
+                    let start = state.ctrl_sent;
+                    let end = state.ctrl_total.min(start + EP_SIZE as usize);
+                    follow = Some((state.ctrl_desc.bytes(), start, end));
                     state.ctrl_sent = end;
                 }
             }
@@ -640,58 +715,61 @@ fn ep0_in() {
                 apply_address = state.pending_address;
                 state.pending_address = 0;
                 state.ctrl = CtrlState::Idle;
-                arm_rx_buffer(SLOT_EP0, 0);
+                // Rearm for the next SETUP.
+                set_rx_count(SLOT[0], EP_SIZE);
+                set_rx_status(0, STS_VALID);
             }
             _ => {
                 state.ctrl = CtrlState::Idle;
-                arm_rx_buffer(SLOT_EP0, 0);
+                set_rx_count(SLOT[0], EP_SIZE);
+                set_rx_status(0, STS_VALID);
             }
         }
     });
-    if let Some((bytes, end)) = chunk {
-        // SAFETY: end <= bytes.len() by the ctrl_total clamp above.
-        let start = end.saturating_sub(EP_SIZE as usize);
+    if let Some((bytes, start, end)) = follow {
         write_packet(BUF_EP0_TX, &bytes[start..end]);
-        set_tx_len(SLOT_EP0, (end - start) as u16);
+        set_tx_count(SLOT[0], (end - start) as u16);
         set_tx_status(0, STS_VALID);
     }
     if apply_address != 0 {
-        reg_write(0x4c, DEVADDR_CEN | apply_address as u32);
+        reg_write(DEVADDR, DEVADDR_CEN | apply_address as u32);
     }
 }
 
-fn ep0_out() {
-    clear_ept_tc(0);
-    let got = rx_received(SLOT_EP0) as usize;
-    let payload = packet_bytes(BUF_EP0_RX, got);
+/// Vendor `usbd_core_out_handler` for EP0: SET_LINE_CODING data, or the
+/// status ZLP OUT of a control read.
+fn ep0_out(payload: &[u8; 64], len: usize) {
     STATE.lock(|cell| {
         let mut state = cell.borrow_mut();
         match state.ctrl {
             CtrlState::DataOut { left } => {
-                if got >= left {
+                if len >= left {
                     state.line_coding = [
                         payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
                         payload[6],
                     ];
                     state.ctrl = CtrlState::StatusIn;
-                    set_tx_len(SLOT_EP0, 0);
+                    // Status: ZLP IN.
+                    set_tx_count(SLOT[0], 0);
                     set_tx_status(0, STS_VALID);
                 } else {
-                    state.ctrl = CtrlState::DataOut { left: left - got };
-                    arm_rx_buffer(SLOT_EP0, 0);
+                    state.ctrl = CtrlState::DataOut { left: left - len };
+                    set_rx_count(SLOT[0], EP_SIZE);
+                    set_rx_status(0, STS_VALID);
                 }
             }
             _ => {
-                // Status-OUT for a control read, or an unexpected OUT.
+                // Status-OUT for a control read: transaction done.
                 state.ctrl = CtrlState::Idle;
-                arm_rx_buffer(SLOT_EP0, 0);
+                set_rx_count(SLOT[0], EP_SIZE);
+                set_rx_status(0, STS_VALID);
             }
         }
     });
 }
 
-fn handle_setup() {
-    let setup = packet_bytes(BUF_EP0_RX, 8);
+/// Vendor `usbd_core_setup_handler`: standard + CDC class requests.
+fn handle_setup(setup: &[u8]) {
     let request_type = setup[0];
     let request = setup[1];
     let value = u16::from(setup[2]) | (u16::from(setup[3]) << 8);
@@ -705,20 +783,21 @@ fn handle_setup() {
                 state.pending_address = value as u8;
                 state.ctrl = CtrlState::StatusIn;
             });
-            set_tx_len(SLOT_EP0, 0);
+            set_tx_count(SLOT[0], 0);
             set_tx_status(0, STS_VALID);
         }
         // SET_CONFIGURATION: non-zero enables the bulk endpoints.
         (0x00, 0x09) => {
             if value != 0 {
-                arm_rx_buffer(SLOT_EP1, 1);
+                set_rx_count(SLOT[1], EP_SIZE);
+                set_rx_status(1, STS_VALID);
             }
             STATE.lock(|cell| {
                 let mut state = cell.borrow_mut();
                 state.configured = value != 0;
                 state.ctrl = CtrlState::StatusIn;
             });
-            set_tx_len(SLOT_EP0, 0);
+            set_tx_count(SLOT[0], 0);
             set_tx_status(0, STS_VALID);
         }
         // GET_STATUS: bus-powered, no remote wake.
@@ -732,9 +811,7 @@ fn handle_setup() {
         (0x80, 0x06) => {
             let kind = (value >> 8) as u8;
             match Descriptor::for_request(kind, value as u8) {
-                Some(descriptor) => {
-                    serve_slice(length, descriptor.bytes(), Some(descriptor))
-                }
+                Some(descriptor) => serve_slice(length, descriptor.bytes(), Some(descriptor)),
                 None => stall_ep0(),
             }
         }
@@ -749,7 +826,8 @@ fn handle_setup() {
                 let mut state = cell.borrow_mut();
                 state.ctrl = CtrlState::DataOut { left: 7 };
             });
-            arm_rx_buffer(SLOT_EP0, 0);
+            set_rx_count(SLOT[0], EP_SIZE);
+            set_rx_status(0, STS_VALID);
         }
         // SET_CONTROL_LINE_STATE and other no-data class requests.
         (0x21, 0x22) | (0x02, 0x01) | (0x02, 0x02) => {
@@ -757,7 +835,7 @@ fn handle_setup() {
                 let mut state = cell.borrow_mut();
                 state.ctrl = CtrlState::StatusIn;
             });
-            set_tx_len(SLOT_EP0, 0);
+            set_tx_count(SLOT[0], 0);
             set_tx_status(0, STS_VALID);
         }
         _ => stall_ep0(),
@@ -770,7 +848,7 @@ fn serve_slice(length: u16, bytes: &[u8], descriptor: Option<Descriptor>) {
     let total = bytes.len().min(length as usize);
     let chunk_len = total.min(EP_SIZE as usize);
     write_packet(BUF_EP0_TX, &bytes[..chunk_len]);
-    set_tx_len(SLOT_EP0, chunk_len as u16);
+    set_tx_count(SLOT[0], chunk_len as u16);
     set_tx_status(0, STS_VALID);
 
     let more = descriptor.filter(|_| total > chunk_len);
@@ -785,14 +863,21 @@ fn serve_slice(length: u16, bytes: &[u8], descriptor: Option<Descriptor>) {
             }
             None => {
                 state.ctrl = CtrlState::StatusOut;
-                arm_rx_buffer(SLOT_EP0, 0);
+                set_rx_count(SLOT[0], EP_SIZE);
+                set_rx_status(0, STS_VALID);
             }
         }
     });
 }
 
 fn stall_ep0() {
+    // Both directions STALL; the next SETUP is a special transaction the
+    // core delivers regardless of the armed state (it also resets the
+    // statuses to NAK), so the endpoint recovers on the next request.
     set_tx_status(0, STS_STALL);
     set_rx_status(0, STS_STALL);
-    idle_ep0();
+    STATE.lock(|cell| {
+        let mut state = cell.borrow_mut();
+        state.ctrl = CtrlState::Idle;
+    });
 }
