@@ -250,6 +250,136 @@ pub fn compute(config: &Config) -> Result<Clocks, Error> {
     })
 }
 
+/// A PLL plan that reaches an exact 48 MHz USB clock: PLL input source
+/// (direct HEXT or HEXT/2), multiplier, and the vendor `crm_usb_div_type`
+/// encoding. Pure, so it can be tested on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UsbPllPlan {
+    pub pll_source: PllSource,
+    pub pll_multiplier: u16,
+    /// Vendor `crm_usb_div_type` encoding.
+    pub usb_encoding: u8,
+    pub pll_hz: u32,
+}
+
+/// Vendor `crm_usb_div_type`: the only divisions that exist, and the PLL
+/// frequencies each turns into 48 MHz.
+const USB_DIV_TABLE: [(u32, u8); 7] = [
+    (3, 0x00),  // DIV_1_5: 72 MHz
+    (2, 0x01),  // DIV_1:   48 MHz
+    (5, 0x02),  // DIV_2_5: 120 MHz
+    (4, 0x03),  // DIV_2:   96 MHz
+    (7, 0x04),  // DIV_3_5: 168 MHz
+    (6, 0x05),  // DIV_3:   144 MHz
+    (8, 0x06),  // DIV_4:   192 MHz
+];
+
+/// Find the fastest PLL running from `hext_hz` (direct or /2) whose output
+/// divides to exactly 48 MHz with a vendor divider. `None` when no integer
+/// combination exists (e.g. a 25 MHz crystal on this device).
+pub fn usb_pll_plan(hext_hz: u32) -> Option<UsbPllPlan> {
+    if hext_hz == 0 {
+        return None;
+    }
+    let mut best: Option<UsbPllPlan> = None;
+    for source in [PllSource::Hext, PllSource::HextDiv2] {
+        let pll_in = match source {
+            PllSource::Hext => hext_hz,
+            PllSource::HextDiv2 => hext_hz / 2,
+            _ => unreachable!(),
+        };
+        // Stated assumption: the PLL input stays within 1..=16 MHz (vendor
+        // examples all run 4 or 8 MHz inputs).
+        if pll_in == 0 || !hext_hz.is_multiple_of(2) && source == PllSource::HextDiv2 {
+            continue;
+        }
+        if pll_in > 16_000_000 || pll_in < 1_000_000 {
+            continue;
+        }
+        for mult in 2u16..=64 {
+            let pll_hz = pll_in.checked_mul(u32::from(mult))?;
+            for &(div_x2, encoding) in USB_DIV_TABLE.iter() {
+                // pll / (div_x2 / 2) == 48 MHz, exact.
+                if pll_hz.checked_mul(2)? == 48_000_000u32.checked_mul(div_x2)? {
+                    let plan = UsbPllPlan {
+                        pll_source: source,
+                        pll_multiplier: mult,
+                        usb_encoding: encoding,
+                        pll_hz,
+                    };
+                    if best.map(|b| plan.pll_hz > b.pll_hz).unwrap_or(true) {
+                        best = Some(plan);
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Clock configuration for USB: run the PLL from the board's crystal
+/// (`hext_hz`) so the USB bit rate is crystal-accurate, falling back to
+/// the 48 MHz HICK profile when no crystal oscillates.
+///
+/// **Why this matters:** USB full-speed transmitters must be within
+/// about ±0.25%; over a 64-byte packet a ±1% clock drifts several bit
+/// times, so the host sees corrupted responses no matter how correct the
+/// protocol layer is. HICK is ±1% and the PLL inherits its input's
+/// accuracy — an uncalibrated-HICK USB transmitter is out of spec, which
+/// is the signature of a device that attaches, receives SETUPs, and
+/// fails every descriptor request. A crystal removes the problem at the
+/// source; the crystalless alternative is ACC (HICK trim via USB SOF),
+/// which is not implemented here.
+///
+/// Returns the checked [`Clocks`] and whether the crystal path was used
+/// (`false` = HICK fallback, whose USB timing is out of spec until ACC
+/// lands).
+///
+/// # Safety
+///
+/// Exclusive-startup contract: call once during startup, before any
+/// peripheral driver or interrupt runs.
+pub unsafe fn configure_usb(hext_hz: u32) -> Result<(Clocks, bool), Error> {
+    // Enable HEXT and wait, bounded, to learn whether a crystal exists.
+    // SAFETY: forwarded from this function's exclusive-startup contract.
+    let crm = unsafe { CRM::steal() };
+    crm.ctrl().modify(|_, w| w.hexten().variant(ctrl::HextenwWO::Enable));
+    let hext_stable = wait_stable(|| crm.ctrl().read().hextstbl().bit()).is_ok();
+
+    match hext_stable.then(|| usb_pll_plan(hext_hz)).flatten() {
+        Some(plan) => {
+            let config = Config {
+                hext_hz,
+                pll_source: plan.pll_source,
+                pll_multiplier: plan.pll_multiplier,
+                ahb: AhbDiv::Div1,
+                apb1: ApbDiv::Div2,
+                apb2: ApbDiv::Div2,
+            };
+            // SAFETY: forwarded from this function's exclusive-startup contract.
+            let clocks = unsafe { configure(config) }?;
+            // The USB divider selection is part of the plan; write it here
+            // (enable_usb_clock would re-derive it, but the plan is the
+            // authority and stays consistent with the PLL just programmed).
+            critical_section::with(|_| {
+                crm.cfg().modify(|_, w| {
+                    // SAFETY: encoding is from the vendor table.
+                    unsafe { w.usbdiv1_0().bits(plan.usb_encoding & 0b11) };
+                    w.usbdiv2().bit(plan.usb_encoding & 0b100 != 0);
+                    w
+                });
+            });
+            Ok((clocks, true))
+        }
+        None => {
+            // No crystal (or no legal plan): HICK fallback.
+            // SAFETY: forwarded from this function's exclusive-startup contract.
+            let clocks = unsafe { configure_hick48() }?;
+            Ok((clocks, false))
+        }
+    }
+}
+
 /// Run the system on the internal 48 MHz HICK, with USB clocked straight
 /// from the same HICK (CRM MISC3.HICK_TO_USB) — the crystalless profile
 /// the AT32 system boot ROM itself uses: no PLL, no USB divider. HICK

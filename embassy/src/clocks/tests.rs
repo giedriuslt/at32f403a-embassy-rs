@@ -110,3 +110,35 @@ fn multiplier_range_covers_raw_encoding() {
         Error::SclkLimit
     );
 }
+
+#[test]
+fn usb_pll_plan_for_8mhz_crystal_prefers_192mhz_div4() {
+    use super::usb_pll_plan;
+    let plan = usb_pll_plan(8_000_000).unwrap();
+    assert_eq!(plan.pll_hz, 192_000_000);
+    assert_eq!(plan.pll_multiplier, 24);
+    assert_eq!(plan.pll_source, super::PllSource::Hext);
+    // DIV_4: 192 / 4 = 48 MHz exactly.
+    assert_eq!(plan.usb_encoding, 0x06);
+}
+
+#[test]
+fn usb_pll_plan_covers_common_crystals() {
+    use super::usb_pll_plan;
+    // 12 MHz: 12 x 16 = 192 (DIV_4).
+    let plan = usb_pll_plan(12_000_000).unwrap();
+    assert_eq!(plan.pll_hz, 192_000_000);
+    assert_eq!(plan.usb_encoding, 0x06);
+    // 16 MHz: 16 x 12 = 192 (DIV_4).
+    let plan = usb_pll_plan(16_000_000).unwrap();
+    assert_eq!(plan.pll_hz, 192_000_000);
+    assert_eq!(plan.usb_encoding, 0x06);
+}
+
+#[test]
+fn usb_pll_plan_rejects_crystals_without_exact_48mhz() {
+    use super::usb_pll_plan;
+    // 25 MHz: no integer multiple lands on a legal USB PLL frequency.
+    assert_eq!(usb_pll_plan(25_000_000), None);
+    assert_eq!(usb_pll_plan(0), None);
+}
