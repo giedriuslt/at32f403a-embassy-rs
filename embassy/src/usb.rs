@@ -115,16 +115,26 @@ fn set_ept_raw(index: usize, value: u32) {
     reg_write(index * 4, value);
 }
 
-/// Set one endpoint's TX status (vendor `USB_SET_TXSTS`: XOR-toggle the
-/// status bits of the masked register, TC flags carried through unchanged).
-fn set_tx_status(index: usize, status: u32) {
-    let value = (ept_raw(index) & EPT_TX_MASK) ^ (status << TXSTS_OFFSET);
+/// Set one endpoint's TX status to `desired`.
+///
+/// The F103-style status field *toggles* on write: the written bits flip
+/// the field. The vendor's `USB_SET_TXSTS` therefore XORs the intended
+/// status against the current one before writing (`epsts ^= DTS0/DTS1`).
+/// Treating the argument as an absolute value instead leaves the endpoint
+/// in an unintended state — NAK to "VALID" writes `10 ^ 11 = 01`, a stall,
+/// which the host sees as a dead descriptor request (Windows Code 43).
+fn set_tx_status(index: usize, desired: u32) {
+    let raw = ept_raw(index);
+    let current = (raw >> TXSTS_OFFSET) & 0b11;
+    let value = (raw & EPT_TX_MASK) ^ ((current ^ desired) << TXSTS_OFFSET);
     set_ept_raw(index, value);
 }
 
-/// Set one endpoint's RX status (vendor `USB_SET_RXSTS`).
-fn set_rx_status(index: usize, status: u32) {
-    let value = (ept_raw(index) & EPT_RX_MASK) ^ (status << RXSTS_OFFSET);
+/// Set one endpoint's RX status to `desired` (toggle semantics as above).
+fn set_rx_status(index: usize, desired: u32) {
+    let raw = ept_raw(index);
+    let current = (raw >> RXSTS_OFFSET) & 0b11;
+    let value = (raw & EPT_RX_MASK) ^ ((current ^ desired) << RXSTS_OFFSET);
     set_ept_raw(index, value);
 }
 
@@ -237,11 +247,13 @@ const LANGID_DESC: [u8; 4] = [0x04, 0x03, 0x09, 0x04];
 /// UTF-16-LE string descriptor (up to 16 characters).
 const fn string_desc(s: &str) -> [u8; 40] {
     let mut out = [0u8; 40];
-    out[0] = 2 + 2 * s.len() as u8;
+    // bLength covers only the characters actually stored (18 max here).
+    let chars = if s.len() > 18 { 18 } else { s.len() };
+    out[0] = 2 + 2 * chars as u8;
     out[1] = 0x03;
     let bytes = s.as_bytes();
     let mut i = 0;
-    while 2 + 2 * i + 1 < out.len() && i < bytes.len() {
+    while 2 + 2 * i + 1 < out.len() && i < bytes.len() && i < chars {
         out[2 + 2 * i] = bytes[i];
         i += 1;
     }
@@ -249,7 +261,7 @@ const fn string_desc(s: &str) -> [u8; 40] {
 }
 
 const MANUFACTURER_DESC: [u8; 40] = string_desc("FNB58 open firmware");
-const PRODUCT_DESC: [u8; 40] = string_desc("FNB58 serial console");
+const PRODUCT_DESC: [u8; 40] = string_desc("FNB58 serial");
 
 // --- Control-transfer state ---
 
@@ -294,6 +306,7 @@ impl Descriptor {
             0x01 => Some(Self::Device),
             0x02 => Some(Self::Config),
             0x03 => Some(match index {
+                0 => Self::LangId,
                 1 => Self::Manufacturer,
                 _ => Self::Product,
             }),
