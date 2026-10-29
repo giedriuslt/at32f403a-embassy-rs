@@ -265,13 +265,13 @@ pub struct UsbPllPlan {
 /// Vendor `crm_usb_div_type`: the only divisions that exist, and the PLL
 /// frequencies each turns into 48 MHz.
 const USB_DIV_TABLE: [(u32, u8); 7] = [
-    (3, 0x00),  // DIV_1_5: 72 MHz
-    (2, 0x01),  // DIV_1:   48 MHz
-    (5, 0x02),  // DIV_2_5: 120 MHz
-    (4, 0x03),  // DIV_2:   96 MHz
-    (7, 0x04),  // DIV_3_5: 168 MHz
-    (6, 0x05),  // DIV_3:   144 MHz
-    (8, 0x06),  // DIV_4:   192 MHz
+    (3, 0x00), // DIV_1_5: 72 MHz
+    (2, 0x01), // DIV_1:   48 MHz
+    (5, 0x02), // DIV_2_5: 120 MHz
+    (4, 0x03), // DIV_2:   96 MHz
+    (7, 0x04), // DIV_3_5: 168 MHz
+    (6, 0x05), // DIV_3:   144 MHz
+    (8, 0x06), // DIV_4:   192 MHz
 ];
 
 /// Find the fastest PLL running from `hext_hz` (direct or /2) whose output
@@ -343,7 +343,8 @@ pub unsafe fn configure_usb(hext_hz: u32) -> Result<(Clocks, bool), Error> {
     // Enable HEXT and wait, bounded, to learn whether a crystal exists.
     // SAFETY: forwarded from this function's exclusive-startup contract.
     let crm = unsafe { CRM::steal() };
-    crm.ctrl().modify(|_, w| w.hexten().variant(ctrl::HextenwWO::Enable));
+    crm.ctrl()
+        .modify(|_, w| w.hexten().variant(ctrl::HextenwWO::Enable));
     let hext_stable = wait_stable(|| crm.ctrl().read().hextstbl().bit()).is_ok();
 
     match hext_stable.then(|| usb_pll_plan(hext_hz)).flatten() {
@@ -400,19 +401,22 @@ pub unsafe fn configure_hick48() -> Result<Clocks, Error> {
     let crm = unsafe { CRM::steal() };
 
     // HICK on and stable (it is the reset source, but verify anyway).
-    crm.ctrl().modify(|_, w| w.hicken().variant(ctrl::HickenwWO::Enable));
+    crm.ctrl()
+        .modify(|_, w| w.hicken().variant(ctrl::HickenwWO::Enable));
     wait_stable(|| crm.ctrl().read().hickstbl().bit()).map_err(|_| Error::HickTimeout)?;
 
     // If an inherited image left the PLL driving SCLK, step down to HICK
     // first (auto-step keeps flash access safe during the switch).
     if crm.cfg().read().sclksts().is_pll() {
-        crm.misc3().modify(|_, w| unsafe { w.auto_step_en().bits(0b01) });
+        crm.misc3()
+            .modify(|_, w| unsafe { w.auto_step_en().bits(0b01) });
         crm.cfg()
             .modify(|_, w| w.sclksel().variant(SCLKSEL_A::Hick));
-        wait_stable(|| crm.cfg().read().sclksts().is_hick())
-            .map_err(|_| Error::SwitchTimeout)?;
-        crm.misc3().modify(|_, w| unsafe { w.auto_step_en().bits(0) });
-        crm.ctrl().modify(|_, w| w.pllen().variant(ctrl::PllenwWO::Disable));
+        wait_stable(|| crm.cfg().read().sclksts().is_hick()).map_err(|_| Error::SwitchTimeout)?;
+        crm.misc3()
+            .modify(|_, w| unsafe { w.auto_step_en().bits(0) });
+        crm.ctrl()
+            .modify(|_, w| w.pllen().variant(ctrl::PllenwWO::Disable));
     }
 
     critical_section::with(|_| {

@@ -19,15 +19,10 @@
 //! status change. Every wait is bounded by an Embassy timeout; a transfer
 //! that cannot progress latches its error and stops generating START/STOP.
 
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll};
-
-use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::Duration;
 
 use crate::pac::at32f403a::i2c1::RegisterBlock;
-use crate::pac::at32f403a::{CRM, I2C1};
+use crate::pac::at32f403a::{CRM, I2C1, I2C2};
 
 /// Default per-step deadline; generous for a 100 kHz bus with clock
 /// stretching (a stuck bus fails at this bound rather than hanging).
@@ -186,14 +181,6 @@ pub enum Instance {
     Apb2,
 }
 
-static WAKER: AtomicWaker = AtomicWaker::new();
-
-/// Board interrupt hook for the `I2Cn_EVT` and `I2Cn_ERR` vectors: wakes
-/// the task waiting for a status-flag change.
-pub fn on_interrupt() {
-    WAKER.wake();
-}
-
 /// The async I²C master over one peripheral instance.
 pub struct I2c {
     i2c: &'static RegisterBlock,
@@ -219,6 +206,30 @@ impl I2c {
         // SAFETY: the peripheral's static register block, exclusively owned by
         // this constructor's contract.
         let i2c = unsafe { &*I2C1::ptr() };
+        let this = Self {
+            i2c,
+            _instance: Instance::Apb1,
+        };
+        this.apply_timing(timing);
+        Ok(this)
+    }
+
+    /// Create the driver over `I2C2` (APB1) and program its timing.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::new_i2c1`], with the `I2C2_EVT` / `I2C2_ERR`
+    /// vectors.
+    pub unsafe fn new_i2c2(pclk_hz: u32, speed: Speed) -> core::result::Result<Self, ConfigError> {
+        let timing = compute_timing(pclk_hz, speed)?;
+        // SAFETY: clock setup under this constructor's exclusive-ownership contract.
+        let crm = unsafe { CRM::steal() };
+        critical_section::with(|_| {
+            crm.apb1en().modify(|_, w| w.i2c2().bit(true));
+        });
+        // SAFETY: the peripheral's static register block, exclusively owned by
+        // this constructor's contract.
+        let i2c = unsafe { &*I2C2::ptr() };
         let this = Self {
             i2c,
             _instance: Instance::Apb1,
@@ -295,19 +306,32 @@ impl I2c {
     /// Wait until `ready` holds, returning its error if a status error
     /// latches first. The waker is registered before the flag check, so an
     /// interrupt between the two only re-polls.
+    /// Poll until `ready` holds or the deadline passes. Timer-backed (a
+    /// 100 us tick) with no interrupt dependency: a masked or never-firing
+    /// I2C interrupt can never hang a transfer — the same lesson the SPI
+    /// driver learned in review. On timeout a STOP is issued so the bus
+    /// is released for the next attempt.
     async fn wait_until(
         &self,
-        ready: impl Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool + Unpin,
+        ready: impl Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool,
     ) -> Result<()> {
-        let deadline = embassy_time::Instant::from_ticks(
-            embassy_time::Instant::now().as_ticks() + STEP_TIMEOUT.as_ticks(),
-        );
-        WaitFlags {
-            i2c: self,
-            ready,
-            deadline,
+        let deadline = embassy_time::Instant::now() + STEP_TIMEOUT;
+        loop {
+            let sts = self.sts1();
+            if let Some(error) = self.check_errors(&sts) {
+                self.stop();
+                self.clear_errors();
+                return Err(error);
+            }
+            if (ready)(&sts) {
+                return Ok(());
+            }
+            if embassy_time::Instant::now() >= deadline {
+                self.stop();
+                return Err(Error::Timeout);
+            }
+            embassy_time::Timer::after_micros(100).await;
         }
-        .await
     }
 
     /// Send START and the address byte, and leave ADDR pending-cleared.
@@ -438,41 +462,6 @@ impl embedded_hal_async::i2c::I2c for I2c {
         // A read that did not end in STOP (a following WriteRead) leaves the
         // bus held; every path here stops, so nothing to do.
         Ok(())
-    }
-}
-
-struct WaitFlags<'a, F>
-where
-    F: Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool,
-{
-    i2c: &'a I2c,
-    ready: F,
-    deadline: embassy_time::Instant,
-}
-
-impl<F> Future for WaitFlags<'_, F>
-where
-    F: Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool + Unpin,
-{
-    type Output = Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        WAKER.register(cx.waker());
-        let sts = this.i2c.sts1();
-        if let Some(error) = this.i2c.check_errors(&sts) {
-            this.i2c.stop();
-            this.i2c.clear_errors();
-            return Poll::Ready(Err(error));
-        }
-        if (this.ready)(&sts) {
-            return Poll::Ready(Ok(()));
-        }
-        if embassy_time::Instant::now() >= this.deadline {
-            this.i2c.stop();
-            return Poll::Ready(Err(Error::Timeout));
-        }
-        Poll::Pending
     }
 }
 

@@ -43,9 +43,9 @@ pub mod gpio;
 pub mod i2c;
 pub mod pwm;
 pub mod spi;
-pub mod usb;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
+pub mod usb;
 
 /// Initialize SysTick after the board configures its clocks.
 ///

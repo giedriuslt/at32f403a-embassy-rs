@@ -35,8 +35,8 @@
 
 use core::cell::RefCell;
 
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 
 /// USBFS register base.
 const USBFS_BASE: usize = 0x4000_5c00;
@@ -249,7 +249,10 @@ fn packet_bytes(offset: usize, len: usize) -> [u8; 64] {
 fn write_packet(offset: usize, bytes: &[u8]) {
     let mut i = 0;
     while i + 1 < bytes.len() {
-        set_packet_half(offset + i, u16::from(bytes[i]) | (u16::from(bytes[i + 1]) << 8));
+        set_packet_half(
+            offset + i,
+            u16::from(bytes[i]) | (u16::from(bytes[i + 1]) << 8),
+        );
         i += 2;
     }
     if i < bytes.len() {
@@ -295,34 +298,98 @@ fn set_rx_count(slot: usize, len: u16) {
 // --- Descriptors (CDC 1.1, single function, bus-powered) ---
 
 const DEVICE_DESC: [u8; 18] = [
-    0x12, 0x01, 0x00, 0x02, // DEVICE, bcdUSB 2.0
-    0x02, 0x00, 0x00, // class CDC
-    EP_SIZE as u8, 0x3c, 0x2e, // EP0 size, VID 0x2e3c
-    0x59, 0x58, // PID 0x5859 default (open firmware CDC)
-    0x00, 0x01, 1, 2, 0, 0x01,
+    0x12,
+    0x01,
+    0x00,
+    0x02, // DEVICE, bcdUSB 2.0
+    0x02,
+    0x00,
+    0x00, // class CDC
+    EP_SIZE as u8,
+    0x3c,
+    0x2e, // EP0 size, VID 0x2e3c
+    0x59,
+    0x58, // PID 0x5859 default (open firmware CDC)
+    0x00,
+    0x01,
+    1,
+    2,
+    0,
+    0x01,
 ];
 /// Byte offset of the PID halfword inside DEVICE_DESC.
 const DEVICE_DESC_PID_OFFSET: usize = 8;
 
 const CONFIG_DESC: [u8; 60] = [
     // Configuration (9): 100 mA, bus-powered.
-    0x09, 0x02, 0x3c, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
+    0x09,
+    0x02,
+    0x3c,
+    0x00,
+    0x02,
+    0x01,
+    0x00,
+    0x80,
+    0x32,
     // Interface 0: CDC control (9).
-    0x09, 0x04, 0x00, 0x00, 0x01, 0x02, 0x02, 0x01, 0x00,
+    0x09,
+    0x04,
+    0x00,
+    0x00,
+    0x01,
+    0x02,
+    0x02,
+    0x01,
+    0x00,
     // Header functional (5).
-    0x05, 0x24, 0x00, 0x10, 0x01,
+    0x05,
+    0x24,
+    0x00,
+    0x10,
+    0x01,
     // ACM functional (4).
-    0x04, 0x24, 0x02, 0x06,
+    0x04,
+    0x24,
+    0x02,
+    0x06,
     // Union functional (5).
-    0x05, 0x24, 0x06, 0x00, 0x01,
+    0x05,
+    0x24,
+    0x06,
+    0x00,
+    0x01,
     // Call management (5).
-    0x05, 0x24, 0x01, 0x00, 0x01,
+    0x05,
+    0x24,
+    0x01,
+    0x00,
+    0x01,
     // Interface 1: CDC data (9).
-    0x09, 0x04, 0x01, 0x00, 0x02, 0x0a, 0x00, 0x00, 0x00,
+    0x09,
+    0x04,
+    0x01,
+    0x00,
+    0x02,
+    0x0a,
+    0x00,
+    0x00,
+    0x00,
     // EP1 OUT bulk (7).
-    0x07, 0x05, 0x01, 0x02, EP_SIZE as u8, 0x00, 0x00,
+    0x07,
+    0x05,
+    0x01,
+    0x02,
+    EP_SIZE as u8,
+    0x00,
+    0x00,
     // EP1 IN bulk (7).
-    0x07, 0x05, 0x81, 0x02, EP_SIZE as u8, 0x00, 0x00,
+    0x07,
+    0x05,
+    0x81,
+    0x02,
+    EP_SIZE as u8,
+    0x00,
+    0x00,
 ];
 
 const LANGID_DESC: [u8; 4] = [0x04, 0x03, 0x09, 0x04];
@@ -680,7 +747,6 @@ pub async fn read(buffer: &mut [u8]) -> Result<usize, Error> {
 pub fn on_interrupt() {
     poll()
 }
-
 
 /// Service the USB cell: drain transfer completions, handle SETUP, handle
 /// bus reset. Mirrors the vendor `usbd_irq_handler` flow.
