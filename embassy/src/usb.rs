@@ -515,8 +515,14 @@ fn open_ept(index: usize, trans_type: u32) {
     ept_write(index, 0);
     // Buffer addresses MUST be in the table before the endpoint is armed;
     // reset leaves them at 0, which aliases every buffer onto the table.
-    set_packet_half(SLOT[index], BUF_SLOT_TX[index] as u16);
-    set_packet_half(SLOT[index] + 8, BUF_SLOT_RX[index] as u16);
+    // The address fields are in HALFWORD units (the vendor's allocator
+    // starts buffers at offset 0x40 = exactly the 8-endpoint table size
+    // in halfwords; its usb_write_packet multiplies offsets by 2) — byte
+    // offsets here made the hardware DMA every packet to a different
+    // address than the driver read, so SETUPs landed in space and the
+    // "descriptor" the host received was garbage from byte 0x40.
+    set_packet_half(SLOT[index], (BUF_SLOT_TX[index] / 2) as u16);
+    set_packet_half(SLOT[index] + 8, (BUF_SLOT_RX[index] / 2) as u16);
     set_ept_slot(index);
     set_trans_type(index, trans_type);
     set_rx_count(SLOT[index], EP_SIZE);
