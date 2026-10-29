@@ -473,6 +473,13 @@ impl Ring {
 static STATE: Mutex<CriticalSectionRawMutex, RefCell<State>> =
     Mutex::new(RefCell::new(State::new()));
 
+/// Bring-up progress marker for the fault handler to blink out: 1 = the
+/// device connected (pull-up on), 2 = a bus reset was serviced, 3 = a
+/// SETUP was dispatched, 4 = a descriptor response was queued. A crash
+/// blinks the last reached value; no blink at all means the crash came
+/// before the connect.
+pub static CRASH_CODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 // --- Public API ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -599,6 +606,7 @@ pub unsafe fn init(pid: u16) {
         reg_write(CTRL, reg_read(CTRL) & !CTRL_DISUSB);
         reg_write(CFG, reg_read(CFG) & !CFG_PUO);
     });
+    CRASH_CODE.store(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn configured() -> bool {
@@ -762,6 +770,7 @@ fn eptn_handler(index: usize) {
 /// Bus reset: address 0, re-open both endpoints, arm EP0 (vendor
 /// `usbd_reset_handler`).
 fn bus_reset() {
+    CRASH_CODE.store(2, core::sync::atomic::Ordering::Relaxed);
     critical_section::with(|_| {
         reg_write(DEVADDR, DEVADDR_CEN);
         open_ept(0, TYPE_CONTROL);
@@ -926,6 +935,7 @@ fn handle_setup(setup: &[u8]) {
 /// Queue a (possibly static) reply for a control read; `descriptor` keeps
 /// streaming when the reply is longer than one packet.
 fn serve_slice(length: u16, bytes: &[u8], descriptor: Option<Descriptor>) {
+    CRASH_CODE.store(4, core::sync::atomic::Ordering::Relaxed);
     let total = bytes.len().min(length as usize);
     let chunk_len = total.min(EP_SIZE as usize);
     write_packet(BUF_EP0_TX, &bytes[..chunk_len]);
