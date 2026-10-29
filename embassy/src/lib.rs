@@ -26,7 +26,10 @@
 //!   time-base picker; the unmapped CM1/CM2 mode registers are written
 //!   through documented raw pointers.
 //!
-//! Not yet implemented: ADC, USB device, flash programming.
+//! - **USB:** CDC ACM virtual COM port on the USBFS cell (EP0 control +
+//!   EP1 bulk, F103-style toggle semantics per the vendor core driver).
+//!
+//! Not yet implemented: ADC, flash programming.
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -40,6 +43,7 @@ pub mod gpio;
 pub mod i2c;
 pub mod pwm;
 pub mod spi;
+pub mod usb;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
 
