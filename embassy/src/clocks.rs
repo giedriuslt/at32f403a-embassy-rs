@@ -250,6 +250,70 @@ pub fn compute(config: &Config) -> Result<Clocks, Error> {
     })
 }
 
+/// Run the system on the internal 48 MHz HICK, with USB clocked straight
+/// from the same HICK (CRM MISC3.HICK_TO_USB) — the crystalless profile
+/// the AT32 system boot ROM itself uses: no PLL, no USB divider. HICK
+/// accuracy (±1 %) is sufficient for full-speed enumeration because USB
+/// receivers resynchronize every packet; long-run signal-integrity work
+/// (ACC SOF calibration) is a later concern, not a smoke-test one.
+///
+/// Returns the checked [`Clocks`] (everything 48 MHz; divided-bus timer
+/// doubling does not apply at divider 1).
+///
+/// # Safety
+///
+/// Call once during exclusive startup, before any peripheral driver or
+/// interrupt runs. Also switches the USB clock source, so call before the
+/// USB cell is enabled.
+pub unsafe fn configure_hick48() -> Result<Clocks, Error> {
+    // SAFETY: forwarded from this function's exclusive-startup contract.
+    let crm = unsafe { CRM::steal() };
+
+    // HICK on and stable (it is the reset source, but verify anyway).
+    crm.ctrl().modify(|_, w| w.hicken().variant(ctrl::HickenwWO::Enable));
+    wait_stable(|| crm.ctrl().read().hickstbl().bit()).map_err(|_| Error::HickTimeout)?;
+
+    // If an inherited image left the PLL driving SCLK, step down to HICK
+    // first (auto-step keeps flash access safe during the switch).
+    if crm.cfg().read().sclksts().is_pll() {
+        crm.misc3().modify(|_, w| unsafe { w.auto_step_en().bits(0b01) });
+        crm.cfg()
+            .modify(|_, w| w.sclksel().variant(SCLKSEL_A::Hick));
+        wait_stable(|| crm.cfg().read().sclksts().is_hick())
+            .map_err(|_| Error::SwitchTimeout)?;
+        crm.misc3().modify(|_, w| unsafe { w.auto_step_en().bits(0) });
+        crm.ctrl().modify(|_, w| w.pllen().variant(ctrl::PllenwWO::Disable));
+    }
+
+    critical_section::with(|_| {
+        // HICK runs at 48 MHz instead of the reset 8 MHz (vendor
+        // CRM_HICK48_NODIV); SCLK follows HICK, so the whole system moves
+        // to 48 MHz with the dividers at 1. Flash stays zero-wait.
+        crm.misc1().modify(|_, w| w.hickdiv().bit(true));
+        crm.cfg().modify(|_, w| {
+            w.sclksel().variant(SCLKSEL_A::Hick);
+            w.ahbdiv().variant(AHBDIV_A::Sclk);
+            w.apb1div().variant(APB1DIV_A::Hclk);
+            w.apb2div().variant(APB1DIV_A::Hclk);
+            w
+        });
+        // USB clock = HICK 48 MHz directly (no USBDIV involved).
+        crm.misc3().modify(|_, w| w.hick_to_usb().bit(true));
+    });
+
+    wait_stable(|| crm.cfg().read().sclksts().is_hick()).map_err(|_| Error::SwitchTimeout)?;
+
+    Ok(Clocks {
+        sclk_hz: 48_000_000,
+        hclk_hz: 48_000_000,
+        pclk1_hz: 48_000_000,
+        pclk2_hz: 48_000_000,
+        hclk_div: 1,
+        pclk1_div: 1,
+        pclk2_div: 1,
+    })
+}
+
 fn wait_stable(mut read: impl FnMut() -> bool) -> Result<(), Error> {
     for _ in 0..WAIT_BOUND {
         if read() {

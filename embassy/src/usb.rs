@@ -579,9 +579,15 @@ pub async fn write(bytes: &[u8]) -> Result<(), Error> {
         if embassy_time::Instant::now() >= deadline {
             return Err(Error::Timeout);
         }
+        poll();
         embassy_time::Timer::after_millis(2).await;
     }
     Ok(())
+}
+
+/// Non-blocking read: returns `Ok(0)` when no bytes are pending.
+pub fn try_read(buffer: &mut [u8]) -> Result<usize, Error> {
+    Ok(STATE.lock(|cell| cell.borrow_mut().rx_ring.take(buffer)))
 }
 
 /// Read bytes received from the host; returns how many were copied. Waits
@@ -599,17 +605,30 @@ pub async fn read(buffer: &mut [u8]) -> Result<usize, Error> {
         if embassy_time::Instant::now() >= deadline {
             return Err(Error::Timeout);
         }
+        poll();
         embassy_time::Timer::after_millis(2).await;
     }
 }
 
 // --- Interrupt handling ---
 
-/// The USBFS interrupt, mirroring the vendor `usbd_irq_handler` flow: the
-/// INTSTS TC flag is level-derived from the per-endpoint TC bits (drain
-/// them in a loop); the reset flag is write-zero-cleared. The board's
-/// `USBFS_H_CAN1_TX` (or `USBFS_L_CAN1_RX0`) handler calls this.
+/// The USBFS interrupt handler body: the board's `USBFS_H_CAN1_TX` (or
+/// `USBFS_L_CAN1_RX0`) handler calls this; pure-polling applications call
+/// [`poll`] from their main loop instead.
 pub fn on_interrupt() {
+    poll()
+}
+
+
+/// Service the USB cell: drain transfer completions, handle SETUP, handle
+/// bus reset. Mirrors the vendor `usbd_irq_handler` flow.
+///
+/// Call from the board's `USBFS_H_CAN1_TX` / `USBFS_L_CAN1_RX0` interrupt
+/// handler (`on_interrupt` wraps this), or poll it from the main loop —
+/// the flags are plain register reads, so polling works with no NVIC
+/// involvement at all. The host tolerates multi-millisecond latency per
+/// control-transfer stage, so a 1-10 ms poll cadence enumerates fine.
+pub fn poll() {
     // Endpoint transfer completions (vendor usbd_ept_loop_handler): each
     // per-endpoint handler clears its TC, which drops INTSTS.TC.
     let mut rounds = 0;
