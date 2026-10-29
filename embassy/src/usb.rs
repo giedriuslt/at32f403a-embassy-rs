@@ -145,19 +145,31 @@ fn ept_write(index: usize, value: u32) {
     reg_write(index * 4, value);
 }
 
-/// Vendor `USB_SET_TXSTS(eptn, new_sts)`: toggle the status bits within
-/// the masked register; TC bits written back as 1 keep their flags.
-/// `desired` is the unshifted two-bit status encoding.
+/// Set one endpoint's TX status to `desired`, from any current state.
+///
+/// The vendor `USB_SET_TXSTS` macro XORs its argument into the current
+/// status field — correct only because vendor call sites always run right
+/// after a TC clear, which resets the field to DISABLE (`00`), making the
+/// XOR an absolute write. Arming an endpoint that is *not* in DISABLE
+/// (e.g. RX NAK from `open_ept` → VALID at init) with the plain macro
+/// computes `10 ^ 11 = 01` = **STALL**: the exact bug that stalled EP0's
+/// receiver from the first SETUP and made every descriptor request fail
+/// (Windows Code 43). XORing `current ^ desired` instead yields the
+/// desired status from any starting state — identical to the vendor's
+/// result on their call sites, and safe on ours.
 fn set_tx_status(index: usize, desired: u32) {
-    let mut value = ept_read(index) & EPT_TX_MASK;
-    value ^= desired << 4;
+    let raw = ept_read(index);
+    let current = (raw >> 4) & 0b11;
+    let value = (raw & EPT_TX_MASK) ^ ((current ^ desired) << 4);
     ept_write(index, value | EPT_RXTC | EPT_TXTC);
 }
 
-/// Vendor `USB_SET_RXSTS(eptn, new_sts)`.
+/// Set one endpoint's RX status to `desired`, from any current state
+/// (semantics as [`set_tx_status`).
 fn set_rx_status(index: usize, desired: u32) {
-    let mut value = ept_read(index) & EPT_RX_MASK;
-    value ^= desired << 12;
+    let raw = ept_read(index);
+    let current = (raw >> 12) & 0b11;
+    let value = (raw & EPT_RX_MASK) ^ ((current ^ desired) << 12);
     ept_write(index, value | EPT_RXTC | EPT_TXTC);
 }
 
