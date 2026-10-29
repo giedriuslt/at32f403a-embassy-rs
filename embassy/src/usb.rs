@@ -451,20 +451,29 @@ pub enum Error {
     Timeout,
 }
 
-/// Program the 48 MHz USB clock from the PLL and reset the USB cell.
+/// Program the 48 MHz USB clock from the PLL (vendor
+/// `crm_usb_clock_div_set`) and reset the USB cell.
+///
+/// The AT32F403A USB divider has no /5: its encodings divide the PLL by
+/// 1.5, 1, 2.5, 2, 3.5, 3 and 4 (vendor `crm_usb_div_type`), so 48 MHz
+/// requires the PLL itself to be 72, 96, 144, 168 or 192 MHz — the reason
+/// the vendor's own USB examples run a 192 MHz PLL (`HICK/2 x 48`) with
+/// `CRM_USB_DIV_4`. A 240 MHz PLL cannot feed USB on this device.
 ///
 /// # Safety
 ///
 /// Exclusive-startup contract: call once during startup, before attaching,
-/// with the PLL running at an exact multiple of 48 MHz.
+/// with the PLL running at one of the supported frequencies above.
 pub unsafe fn enable_usb_clock(pll_hz: u32) -> Result<(), Error> {
-    if !pll_hz.is_multiple_of(48_000_000) {
-        return Err(Error::Clock);
-    }
-    let divider = pll_hz / 48_000_000;
-    if divider == 0 || divider > 8 {
-        return Err(Error::Clock);
-    }
+    // Vendor crm_usb_div_type encodings for 48 MHz-capable PLLs.
+    let encoding: u8 = match pll_hz {
+        72_000_000 => 0x00,  // DIV_1_5
+        96_000_000 => 0x02,  // DIV_2_5
+        144_000_000 => 0x05, // DIV_3
+        168_000_000 => 0x04, // DIV_3_5
+        192_000_000 => 0x06, // DIV_4
+        _ => return Err(Error::Clock),
+    };
     // SAFETY: forwarded from this function's exclusive-startup contract.
     let crm = unsafe { crate::pac::at32f403a::CRM::steal() };
     critical_section::with(|_| {
@@ -474,12 +483,11 @@ pub unsafe fn enable_usb_clock(pll_hz: u32) -> Result<(), Error> {
         crm.apb1en().modify(|_, w| w.usb().bit(true));
         crm.apb1rst().modify(|_, w| w.usb().bit(true));
         crm.apb1rst().modify(|_, w| w.usb().bit(false));
-        // PLL / divider = 48 MHz: USBDIV2 carries bit 2 of (divider - 1).
-        let raw = divider - 1;
+        // Vendor field split: USBDIV1_0 = encoding bits 1:0, USBDIV2 = bit 2.
         crm.cfg().modify(|_, w| {
-            // SAFETY: divider is 1..=8, so raw is 0..=7.
-            unsafe { w.usbdiv1_0().bits((raw & 0b11) as u8) };
-            w.usbdiv2().bit(raw & 0b100 != 0);
+            // SAFETY: the encoding is the vendor enum value, within the field.
+            unsafe { w.usbdiv1_0().bits(encoding & 0b11) };
+            w.usbdiv2().bit(encoding & 0b100 != 0);
             w
         });
     });
