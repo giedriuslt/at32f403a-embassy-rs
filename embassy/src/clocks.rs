@@ -502,7 +502,15 @@ pub unsafe fn configure(config: Config) -> Result<Clocks, Error> {
     // Program the PLL while it is disabled.
     crm.ctrl()
         .modify(|_, w| w.pllen().variant(ctrl::PllenwWO::Disable));
-    let raw_mult = (config.pll_multiplier - 2) as u8;
+    // Artery's PLLMULT field encoding (cf. CRM_PLL_MULT_* enum):
+    // multiplier 2..=16 -> raw 0..=14 (mult-2), multiplier 17..=64 ->
+    // raw 16..=63 (mult-1; raw 15 is x16). Writing mult-2 for mult > 16
+    // silently selects a different multiplier (e.g. 24 -> raw 22 = x23).
+    let raw_mult = if config.pll_multiplier >= 17 {
+        (config.pll_multiplier - 1) as u8
+    } else {
+        (config.pll_multiplier - 2) as u8
+    };
     crm.cfg().modify(|_, w| {
         w.pllrcs().bit(matches!(
             config.pll_source,
