@@ -256,13 +256,9 @@ impl I2c {
         self.i2c
             .ctrl1()
             .modify(|_, w| w.i2cen().variant(I2cenwWO::Enable));
-        // Event, buffer and error interrupts drive the waits.
-        self.i2c.ctrl2().modify(|_, w| {
-            w.evtien().bit(true);
-            w.errien().bit(true);
-            w.dataien().bit(true);
-            w
-        });
+        // Waits poll STS on an embassy timer (the SPI-review lesson: never
+        // depend on interrupt delivery), so the peripheral's interrupt
+        // sources stay off; nothing is wired to I2Cn_EVT/I2Cn_ERR.
     }
 
     fn sts1(&self) -> crate::pac::at32f403a::i2c1::sts1::R {
