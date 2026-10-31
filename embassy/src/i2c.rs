@@ -10,7 +10,10 @@
 //!
 //! Transaction sequences follow the vendor `i2c_application` library:
 //! START → address (wait `STARTF`, then `ADDR7F`, ACK-checked) → the
-//! 1/2/3-byte read endgames with ACK and POS (`MACKCTRL`) → STOP. The
+//! 1/2/3-byte read endgames with ACK and POS (`MACKCTRL`) → STOP. Like the
+//! vendor, every receive begins by resetting the master ACK state (POS to
+//! the current byte, ACK enabled) — the peripheral latches no per-transfer
+//! defaults, so the endgame state of one read must not leak into the next. The
 //! `ADDR7F` flag is cleared by reading STS1 then STS2, as the F1-style
 //! hardware requires.
 //!
@@ -330,10 +333,24 @@ impl I2c {
         }
     }
 
-    /// Send START and the address byte, and leave ADDR pending-cleared.
+    /// Send START and the address byte, leaving ADDR7F pending. The caller
+    /// clears it via [`Self::clear_addr`], which applies the endgame ACK
+    /// configuration in the vendor order.
     async fn start_address(&self, address: u8, read: bool) -> Result<()> {
         // Clear errors from any previous transfer before judging this one.
         self.clear_errors();
+        // Vendor receive prologue (i2c_memory_read/i2c_master_receive): POS
+        // back to "current byte", ACK enabled. The previous receive's
+        // endgame leaves ACKEN=0/MACKCTRL=Next behind; if that leaks into
+        // this transfer, the first data byte gets NACKed, the slave
+        // releases SDA mid-read, and trailing bytes read as 0xFF garbage
+        // (silently — a master-side NACK raises no ACKFAIL).
+        self.i2c
+            .ctrl1()
+            .modify(|_, w| w.mackctrl().variant(MACKCTRL_A::Current));
+        self.i2c
+            .ctrl1()
+            .modify(|_, w| w.acken().variant(AckenwWO::Enable));
         self.i2c
             .ctrl1()
             .modify(|_, w| w.genstart().variant(GENSTART_A::Start));
@@ -341,10 +358,46 @@ impl I2c {
         let byte = (address << 1) | u8::from(read);
         self.i2c.dt().write(|w| unsafe { w.dt().bits(byte) });
         self.wait_until(|sts| sts.addr7f().bit()).await?;
-        // F1-style ADDR clear: read STS1, then STS2.
+        Ok(())
+    }
+
+    /// Clear ADDR7F (F1-style: read STS1, then STS2). Clearing ADDR ends
+    /// the clock stretch and starts the first data byte, so for a receive
+    /// the endgame ACK configuration goes around the clear in the vendor
+    /// `i2c_memory_read` order: MACKCTRL/ACKEN first, ADDR clear, then the
+    /// 2-byte ACKEN.
+    fn clear_addr(&self, receive_len: Option<usize>) {
+        match receive_len {
+            Some(1) => {
+                // The only byte is NACKed: disable ACK before the clear.
+                self.ack_set(false);
+            }
+            Some(2) => {
+                // POS=Next defers the coming ACKEN=0 to byte 2.
+                self.i2c
+                    .ctrl1()
+                    .modify(|_, w| w.mackctrl().variant(MACKCTRL_A::Next));
+            }
+            _ => {
+                self.ack_set(true);
+            }
+        }
         let _ = self.sts1();
         let _ = self.i2c.sts2().read();
-        Ok(())
+        if receive_len == Some(2) {
+            // Byte 1's ACK is now pipelined; NACK byte 2.
+            self.ack_set(false);
+        }
+    }
+
+    fn ack_set(&self, enable: bool) {
+        self.i2c.ctrl1().modify(|_, w| {
+            w.acken().variant(if enable {
+                AckenwWO::Enable
+            } else {
+                AckenwWO::Disable
+            })
+        });
     }
 
     async fn write_bytes(&self, bytes: &[u8], last_in_transaction: bool) -> Result<()> {
@@ -360,38 +413,16 @@ impl I2c {
     }
 
     /// The vendor read endgame: exact ACK/POS handling for the last three
-    /// bytes (`i2c_application.c` receive sequence).
+    /// bytes (`i2c_application.c` receive sequence). The ACK configuration
+    /// around the ADDR clear already happened in [`Self::clear_addr`].
     async fn read_bytes(&self, buffer: &mut [u8]) -> Result<()> {
-        let mut remaining = buffer.len();
-        let ack_all = |enable: bool| {
-            self.i2c.ctrl1().modify(|_, w| {
-                w.acken().variant(if enable {
-                    AckenwWO::Enable
-                } else {
-                    AckenwWO::Disable
-                })
-            });
-        };
-
-        match buffer.len() {
-            0 => return Ok(()),
-            1 => {
-                // No ACK for the only byte: STOP right after the address.
-                ack_all(false);
-                self.stop();
-            }
-            2 => {
-                // ACK the current byte, NACK the next, one clock stretch.
-                self.i2c
-                    .ctrl1()
-                    .modify(|_, w| w.mackctrl().variant(MACKCTRL_A::Next));
-                ack_all(false);
-            }
-            _ => {
-                ack_all(true);
-            }
+        // A single byte is NACKed and stopped before it arrives (vendor
+        // size==1 flow: ACK off, ADDR clear, STOP, then wait for data).
+        if buffer.len() == 1 {
+            self.stop();
         }
 
+        let mut remaining = buffer.len();
         let mut index = 0;
         while remaining > 0 {
             if remaining == 1 {
@@ -408,7 +439,7 @@ impl I2c {
             } else if remaining == 3 {
                 self.wait_until(|sts| sts.tdc().bit()).await?;
                 // NACK from the next received byte on.
-                ack_all(false);
+                self.ack_set(false);
                 buffer[index] = self.i2c.dt().read().dt().bits();
                 index += 1;
                 self.wait_until(|sts| sts.tdc().bit()).await?;
@@ -444,10 +475,12 @@ impl embedded_hal_async::i2c::I2c for I2c {
             match operation {
                 embedded_hal_async::i2c::Operation::Write(buffer) => {
                     self.start_address(address, false).await?;
+                    self.clear_addr(None);
                     self.write_bytes(buffer, is_last).await?;
                 }
                 embedded_hal_async::i2c::Operation::Read(buffer) => {
                     self.start_address(address, true).await?;
+                    self.clear_addr(Some(buffer.len()));
                     self.read_bytes(buffer).await?;
                     // Single-byte reads already generated STOP inside the
                     // endgame; longer ones stopped after the final read.
