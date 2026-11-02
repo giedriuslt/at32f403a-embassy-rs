@@ -20,7 +20,7 @@ use crate::pac::at32f403a::spi1::ctrl1::{
     CLKPHA_A as ClkphaA, CLKPOL_A as ClkpolA, FBN_A as FbnA, LTF_A as LtfA, MSTEN_A as MstenA,
     SLBTD_A, SWCSIL_A, SlbenwWO, SpienwWO, SwcsenwWO,
 };
-use crate::pac::at32f403a::{CRM, SPI1};
+use crate::pac::at32f403a::{CRM, SPI1, SPI2};
 
 /// SPI clock mode (CPOL, CPHA).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +115,26 @@ impl Spi {
         this
     }
 
+    /// Create the driver over `SPI2` (APB1). The register block layout is
+    /// identical to SPI1's (same IP; the PAC types share
+    /// [`spi1::RegisterBlock`]).
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::new_spi1`].
+    pub unsafe fn new_spi2(mode: Mode, divider: Divider) -> Self {
+        let crm = unsafe { CRM::steal() };
+        critical_section::with(|_| {
+            crm.apb1en().modify(|_, w| w.spi2().bit(true));
+        });
+        // SAFETY: the peripheral's static register block under this
+        // constructor's exclusive-ownership contract; same layout type.
+        let spi = unsafe { &*SPI2::ptr() };
+        let this = Self { spi };
+        this.configure(mode, divider);
+        this
+    }
+
     fn configure(&self, mode: Mode, divider: Divider) {
         // Program with the peripheral disabled, then enable (spi_init order).
         self.spi.ctrl1().modify(|_, w| {
@@ -196,6 +216,32 @@ impl Spi {
             self.spi.dt().write(|w| unsafe { w.bits(u16::from(byte)) });
         }
         self.flush().await
+    }
+
+    /// Write bytes with tight TDBE busy-polling — no timer futures, no
+    /// executor round-trips per byte. Blocks the task for the transfer
+    /// duration (12 MHz SCK is ~0.7 us/byte); intended for bulk pixel
+    /// data on single-task firmware, where the C drivers busy-wait too.
+    pub fn write_busy(&self, bytes: &[u8]) -> Result<(), Error> {
+        for &byte in bytes {
+            loop {
+                let sts = self.sts();
+                if sts.mmerr().bit() {
+                    // MMERR clears on an STS read; the read above cleared
+                    // it before reporting.
+                    return Err(Error::ModeFault);
+                }
+                if sts.tdbe().bit() {
+                    break;
+                }
+            }
+            // SAFETY: 8-bit frame in a whole-value 16-bit data register.
+            self.spi.dt().write(|w| unsafe { w.bits(u16::from(byte)) });
+        }
+        // Idle fence: the last byte must leave the shifter before the
+        // caller changes D/C or chip-select.
+        while self.sts().bf().bit() {}
+        Ok(())
     }
 
     /// Write a long buffer through DMA (pixel bursts), request `SPI1_TX`.
