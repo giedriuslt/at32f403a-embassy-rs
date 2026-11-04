@@ -89,6 +89,12 @@ pub enum Error {
 }
 
 /// SPI master over one peripheral instance.
+///
+/// `Copy`: the handle is just a `&'static RegisterBlock` — several drivers
+/// may hold copies of one bus as long as only one of them drives it at a
+/// time (the FNB58's LCD and W25Q128 flash share SPI2, selected by their
+/// own chip-select pins).
+#[derive(Clone, Copy)]
 pub struct Spi {
     spi: &'static RegisterBlock,
 }
@@ -216,6 +222,62 @@ impl Spi {
             self.spi.dt().write(|w| unsafe { w.bits(u16::from(byte)) });
         }
         self.flush().await
+    }
+
+    /// Switch to normal full-duplex mode (MISO receive active). Used by
+    /// drivers that read from a shared bus (the LCD is write-only and
+    /// keeps the single-wire transmit mode).
+    pub fn set_full_duplex(&self) {
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.spien().variant(SpienwWO::Disable));
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.slben().variant(SlbenwWO::Disable));
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.spien().variant(SpienwWO::Enable));
+    }
+
+    /// Switch back to single-wire transmit-only mode (the LCD's mode).
+    pub fn set_single_wire_transmit(&self) {
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.spien().variant(SpienwWO::Disable));
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.slben().variant(SlbenwWO::Enable));
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.slbtd().variant(SLBTD_A::Transmit));
+        self.spi
+            .ctrl1()
+            .modify(|_, w| w.spien().variant(SpienwWO::Enable));
+    }
+
+    /// Full-duplex transfer: every byte in `bytes` is clocked out while
+    /// the received byte is collected into `out` (shorter `out` = extra
+    /// bytes drained). Busy-polls; blocks the task for the transfer.
+    pub fn transfer_busy(&self, bytes: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        for (i, &b) in bytes.iter().enumerate() {
+            loop {
+                let sts = self.sts();
+                if sts.mmerr().bit() {
+                    return Err(Error::ModeFault);
+                }
+                if sts.tdbe().bit() {
+                    break;
+                }
+            }
+            // SAFETY: 8-bit frame in a whole-value 16-bit data register.
+            self.spi.dt().write(|w| unsafe { w.bits(u16::from(b)) });
+            while self.sts().bf().bit() {}
+            let received = self.spi.dt().read().bits() as u8;
+            if i < out.len() {
+                out[i] = received;
+            }
+        }
+        Ok(())
     }
 
     /// Write bytes with tight TDBE busy-polling — no timer futures, no
