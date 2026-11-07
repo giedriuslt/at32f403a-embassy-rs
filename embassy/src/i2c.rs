@@ -305,11 +305,19 @@ impl I2c {
     /// Wait until `ready` holds, returning its error if a status error
     /// latches first. The waker is registered before the flag check, so an
     /// interrupt between the two only re-polls.
-    /// Poll until `ready` holds or the deadline passes. Timer-backed (a
-    /// 100 us tick) with no interrupt dependency: a masked or never-firing
-    /// I2C interrupt can never hang a transfer — the same lesson the SPI
-    /// driver learned in review. On timeout a STOP is issued so the bus
-    /// is released for the next attempt.
+    /// Poll until `ready` holds or the deadline passes. Spin-backed (a
+    /// ~10 us cadence) with no interrupt dependency: a masked or
+    /// never-firing I2C interrupt can never hang a transfer — the same
+    /// lesson the SPI driver learned in review. On timeout a STOP is
+    /// issued so the bus is released for the next attempt.
+    ///
+    /// r170: the inter-poll wait was `Timer::after_micros(100)`, but this
+    /// firmware runs embassy-time at a 1 ms tick (tick-hz-1_000), so every
+    /// 100 us request rounded UP to a full tick: each flag wait cost >=1 ms
+    /// and a transaction ~5 ms (r169's `i2c 10rd=50ms`) — 16x the bus's own
+    /// byte time, which alone blew every PD request window (the r115-era
+    /// wall). The ~10 us spin keeps the no-interrupt design and the 50 ms
+    /// deadline; at 192 MHz it is ~0.5% CPU per active transfer.
     async fn wait_until(
         &self,
         ready: impl Fn(&crate::pac::at32f403a::i2c1::sts1::R) -> bool,
@@ -329,7 +337,7 @@ impl I2c {
                 self.stop();
                 return Err(Error::Timeout);
             }
-            embassy_time::Timer::after_micros(100).await;
+            cortex_m::asm::delay(1920);
         }
     }
 
