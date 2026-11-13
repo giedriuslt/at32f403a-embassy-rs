@@ -14,7 +14,7 @@
 
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll};
 
 use embassy_sync::waitqueue::AtomicWaker;
@@ -61,15 +61,21 @@ pub enum Width {
     Bit32,
 }
 
-/// Flexible request source (`DMA_SRC_SEL0/1` values; vendor
-/// `dma_flexible_request_type`). Only the sources this HAL's drivers need
-/// are listed; extend from the vendor enum as drivers appear.
+/// Flexible request source (`DMA_SRC_SEL0/1` values; RM V2.06 Table 9-5
+/// and the vendor `dma_flexible_request_type`). Only the sources this
+/// HAL's drivers need are listed; extend from the vendor enum as drivers
+/// appear. NOTE (2026-11-11, the r199 hardware round): the ADC and I2C
+/// values below were taken from a misaligned table — with the previous
+/// Adc1=0x00 ("No select") the channel never received any request and
+/// every transfer timed out. Corrected against the vendor header:
+/// 0x00 is "No select", 0x02 is RESERVED (the AT32F403A's ADC2 has NO
+/// DMA request line — RM p.133 Table 9-5 and p.323), so no `Adc2`
+/// variant exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Request {
-    Adc1 = 0x00,
-    Adc2 = 0x01,
-    Adc3 = 0x02,
+    Adc1 = 0x01,
+    Adc3 = 0x03,
     Spi1Rx = 0x09,
     Spi1Tx = 0x0A,
     Spi2Rx = 0x0B,
@@ -78,12 +84,12 @@ pub enum Request {
     Spi3Tx = 0x0E,
     Spi4Rx = 0x0F,
     Spi4Tx = 0x10,
-    I2c1Rx = 0x14,
-    I2c1Tx = 0x15,
-    I2c2Rx = 0x16,
-    I2c2Tx = 0x17,
-    I2c3Rx = 0x18,
-    I2c3Tx = 0x19,
+    I2c1Rx = 0x29,
+    I2c1Tx = 0x2A,
+    I2c2Rx = 0x2B,
+    I2c2Tx = 0x2C,
+    I2c3Rx = 0x2D,
+    I2c3Tx = 0x2E,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -101,8 +107,21 @@ pub enum Error {
 const CHANNELS: usize = 7;
 static WAKERS: [[AtomicWaker; CHANNELS]; 2] =
     [const { [const { AtomicWaker::new() }; CHANNELS] }; 2];
-static RUNNING: [[AtomicBool; CHANNELS]; 2] =
-    [const { [const { AtomicBool::new(false) }; CHANNELS] }; 2];
+
+/// Per-channel transfer state. The r201 FNB58 round taught the exact
+/// contract an F1-style DMA IRQ demands: the ISR MUST clear the
+/// hardware flags (they stay asserted otherwise — the exception
+/// re-pends forever and thread mode starves: a total freeze), yet the
+/// woken `wait()` poll must still be able to observe a completion whose
+/// flags the ISR already cleared (the r200 lost-wakeup). So the ISR
+/// clears the flags AND records the outcome here; the poll consumes the
+/// state (or the raw flags, if it runs before the ISR).
+const STATE_IDLE: u8 = 0;
+const STATE_RUNNING: u8 = 1;
+const STATE_DONE: u8 = 2;
+const STATE_ERROR: u8 = 3;
+static STATE: [[AtomicU8; CHANNELS]; 2] =
+    [const { [const { AtomicU8::new(STATE_IDLE) }; CHANNELS] }; 2];
 
 fn unit_index(unit: Unit) -> usize {
     match unit {
@@ -173,7 +192,7 @@ impl Channel {
             return Err(Error::TooLong);
         }
         let slot = (unit_index(self.unit), self.number as usize - 1);
-        if RUNNING[slot.0][slot.1].swap(true, Ordering::AcqRel) {
+        if STATE[slot.0][slot.1].swap(STATE_RUNNING, Ordering::AcqRel) == STATE_RUNNING {
             return Err(Error::Busy);
         }
 
@@ -218,9 +237,18 @@ impl Channel {
         channel.ctrl().modify(|_, w| {
             w.chen().variant(ChenwWO::Disable);
             w.m2m().variant(M2mwWO::Disable);
+            // DTD (RM 9.x, CTRL bit 4): 0 = READ FROM PERIPHERALS, 1 =
+            // READ FROM MEMORY (vendor: DMA_DIR_PERIPHERAL_TO_MEMORY =
+            // 0x0000). The mapping below was INVERTED since the module
+            // was written — every "peripheral-to-memory" transfer was
+            // actually memory-to-peripheral: it read the destination
+            // buffer and WROTE it into the peripheral register (the
+            // r204-r206 FNB58 rounds: ADC bursts that zeroed ODT and
+            // left the samples untouched; an M2M probe wrote zeros into
+            // its own source).
             w.dtd().variant(match direction {
-                Direction::MemoryToPeripheral => DtdA::Peripherals,
-                Direction::PeripheralToMemory => DtdA::Memory,
+                Direction::PeripheralToMemory => DtdA::Peripherals,
+                Direction::MemoryToPeripheral => DtdA::Memory,
             });
             w.pwidth().variant(pwidth);
             w.mwidth().variant(mwidth);
@@ -259,8 +287,11 @@ impl Channel {
             w.dterrien().variant(DterrienwWO::Disable);
             w
         });
+        // A completing transfer can leave its flag set with the enable
+        // now off; clear it so no later waiter mistakes the stale flag.
+        clear_flags(self.unit.block(), self.number);
         let slot = (unit_index(self.unit), self.number as usize - 1);
-        RUNNING[slot.0][slot.1].store(false, Ordering::Release);
+        STATE[slot.0][slot.1].store(STATE_IDLE, Ordering::Release);
     }
 
     /// Wait for the transfer to complete (full-transfer flag) or report its
@@ -276,7 +307,7 @@ impl Channel {
     /// Whether the channel still has a transfer in flight.
     pub fn is_running(&self) -> bool {
         let slot = (unit_index(self.unit), self.number as usize - 1);
-        RUNNING[slot.0][slot.1].load(Ordering::Acquire)
+        STATE[slot.0][slot.1].load(Ordering::Acquire) == STATE_RUNNING
     }
 }
 
@@ -308,19 +339,28 @@ fn clear_flags(block: &crate::pac::at32f403a::dma1::RegisterBlock, number: u8) {
     block.clr().write(|w| dma_clear_field!(w, number));
 }
 
-/// Board interrupt hook: service one channel's full/error flags and wake its
-/// waiter. Returns `true` when something was pending.
+/// Board interrupt hook: record the outcome, CLEAR THE HARDWARE FLAGS
+/// (an F1-style DMA flag stays asserted until written back — leaving it
+/// makes the exception re-pend forever and starves thread mode: the
+/// r201 FNB58 freeze), then wake the waiter. [`TransferWait`]'s poll
+/// consumes the recorded state, so clearing here cannot lose the
+/// wakeup (the r200 bug). Returns `true` when something was pending.
 pub fn on_interrupt(unit: Unit, number: u8) -> bool {
     let block = unit.block();
     let sts = block.sts().read();
     let done = sts_fdt(&sts, number);
     let error = sts_dterr(&sts, number);
     if done || error {
-        clear_flags(block, number);
         let slot = (unit_index(unit), number as usize - 1);
-        if done {
-            RUNNING[slot.0][slot.1].store(false, Ordering::Release);
+        // Record first, clear second: a concurrent poll that misses the
+        // flags still observes the state.
+        if error {
+            STATE[slot.0][slot.1].store(STATE_ERROR, Ordering::Release);
         }
+        if done {
+            STATE[slot.0][slot.1].store(STATE_DONE, Ordering::Release);
+        }
+        clear_flags(block, number);
         WAKERS[slot.0][slot.1].wake();
     }
     done || error
@@ -338,18 +378,31 @@ impl Future for TransferWait {
         let slot = (unit_index(self.unit), self.number as usize - 1);
         WAKERS[slot.0][slot.1].register(cx.waker());
         let block = self.unit.block();
+        // The raw flags, for a poll that runs before the ISR.
         let sts = block.sts().read();
         if sts_dterr(&sts, self.number) {
             clear_flags(block, self.number);
-            RUNNING[slot.0][slot.1].store(false, Ordering::Release);
+            STATE[slot.0][slot.1].store(STATE_IDLE, Ordering::Release);
             return Poll::Ready(Err(Error::DataError));
         }
         if sts_fdt(&sts, self.number) {
             clear_flags(block, self.number);
-            RUNNING[slot.0][slot.1].store(false, Ordering::Release);
+            STATE[slot.0][slot.1].store(STATE_IDLE, Ordering::Release);
             return Poll::Ready(Ok(()));
         }
-        Poll::Pending
+        // The ISR-recorded outcome, for a poll woken after the ISR
+        // cleared the flags (the r200 lost-wakeup).
+        match STATE[slot.0][slot.1].load(Ordering::Acquire) {
+            state @ (STATE_DONE | STATE_ERROR) => {
+                STATE[slot.0][slot.1].store(STATE_IDLE, Ordering::Release);
+                if state == STATE_ERROR {
+                    Poll::Ready(Err(Error::DataError))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            _ => Poll::Pending,
+        }
     }
 }
 
